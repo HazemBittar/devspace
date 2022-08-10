@@ -1,8 +1,7 @@
 package git
 
 import (
-	"io/ioutil"
-	"os"
+	"context"
 	"testing"
 )
 
@@ -12,18 +11,14 @@ const testTag = "tag1"
 const testRepo = "https://github.com/thockin/test"
 
 func TestGitCliCommit(t *testing.T) {
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
-	gitRepo, err := NewGitCLIRepository(tempDir)
+	gitRepo, err := NewGitCLIRepository(context.Background(), tempDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = gitRepo.Clone(CloneOptions{
+	err = gitRepo.Clone(context.Background(), CloneOptions{
 		URL:    testRepo,
 		Commit: testCheckoutHash,
 	})
@@ -31,7 +26,7 @@ func TestGitCliCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = gitRepo.Clone(CloneOptions{
+	err = gitRepo.Clone(context.Background(), CloneOptions{
 		URL:    testRepo,
 		Commit: testCheckoutHash,
 	})
@@ -39,7 +34,7 @@ func TestGitCliCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hash, err := GetHash(tempDir)
+	hash, err := GetHash(context.Background(), tempDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,18 +44,14 @@ func TestGitCliCommit(t *testing.T) {
 }
 
 func TestGitCliBranch(t *testing.T) {
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
-	gitRepo, err := NewGitCLIRepository(tempDir)
+	gitRepo, err := NewGitCLIRepository(context.Background(), tempDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = gitRepo.Clone(CloneOptions{
+	err = gitRepo.Clone(context.Background(), CloneOptions{
 		URL:    testRepo,
 		Branch: testBranch,
 	})
@@ -68,7 +59,7 @@ func TestGitCliBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = gitRepo.Clone(CloneOptions{
+	err = gitRepo.Clone(context.Background(), CloneOptions{
 		URL:            testRepo,
 		Branch:         testBranch,
 		DisableShallow: true,
@@ -87,14 +78,10 @@ func TestGitCliBranch(t *testing.T) {
 }
 
 func TestGoGit(t *testing.T) {
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	gitRepo := NewGoGitRepository(tempDir, testRepo)
-	err = gitRepo.Update(true)
+	err := gitRepo.Update(true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,10 +89,7 @@ func TestGoGit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = gitRepo.Update(true)
-	if err != nil {
-		t.Fatal(err)
-	}
+
 	remote, err := GetRemote(tempDir)
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +103,7 @@ func TestGoGit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hash, err := GetHash(tempDir)
+	hash, err := GetHash(context.Background(), tempDir)
 	if err != nil {
 		t.Fatal(err)
 	}

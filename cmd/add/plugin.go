@@ -14,7 +14,7 @@ func newPluginCmd(f factory.Factory) *cobra.Command {
 	cmd := &pluginCmd{}
 	pluginCmd := &cobra.Command{
 		Use:   "plugin",
-		Short: "Add a plugin to devspace",
+		Short: "Adds a plugin to devspace",
 		Long: `
 #######################################################
 ############### devspace add plugin ###################
@@ -36,19 +36,15 @@ devspace add plugin https://github.com/my-plugin/plugin
 
 // Run executes the command logic
 func (cmd *pluginCmd) Run(f factory.Factory, args []string) error {
-	f.GetLog().StartWait("Installing plugin " + args[0])
-	defer f.GetLog().StopWait()
-
+	f.GetLog().Info("Installing plugin " + args[0])
 	addedPlugin, err := f.NewPluginManager(f.GetLog()).Add(args[0], cmd.Version)
 	if err != nil {
 		return err
 	}
-
-	f.GetLog().StopWait()
 	f.GetLog().Donef("Successfully installed plugin %s", args[0])
 
 	// Execute plugin hook
-	err = plugin.ExecutePluginHookAt(*addedPlugin, "after_install")
+	err = plugin.ExecutePluginHookAt(*addedPlugin, "after:installPlugin", "after_install")
 	if err != nil {
 		return err
 	}

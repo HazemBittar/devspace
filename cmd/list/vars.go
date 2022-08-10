@@ -1,12 +1,12 @@
 package list
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
 
 	"github.com/loft-sh/devspace/cmd/flags"
-	"github.com/loft-sh/devspace/pkg/devspace/config/loader"
 	"github.com/loft-sh/devspace/pkg/util/factory"
 	"github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/loft-sh/devspace/pkg/util/message"
@@ -47,7 +47,10 @@ values
 func (cmd *varsCmd) RunListVars(f factory.Factory, cobraCmd *cobra.Command, args []string) error {
 	logger := f.GetLog()
 	// Set config root
-	configLoader := f.NewConfigLoader(cmd.ConfigPath)
+	configLoader, err := f.NewConfigLoader(cmd.ConfigPath)
+	if err != nil {
+		return err
+	}
 	configExists, err := configLoader.SetDevSpaceRoot(logger)
 	if err != nil {
 		return err
@@ -57,7 +60,7 @@ func (cmd *varsCmd) RunListVars(f factory.Factory, cobraCmd *cobra.Command, args
 	}
 
 	// Fill variables config
-	config, err := configLoader.LoadWithParser(loader.NewWithCommandsParser(), cmd.ToConfigOptions(logger), logger)
+	config, err := configLoader.Load(context.Background(), nil, cmd.ToConfigOptions(), logger)
 	if err != nil {
 		return err
 	}
@@ -77,6 +80,9 @@ func (cmd *varsCmd) RunListVars(f factory.Factory, cobraCmd *cobra.Command, args
 				fmt.Sprintf("%v", value),
 			})
 		}
+		sort.Slice(varRow, func(i, j int) bool {
+			return varRow[i][0] < varRow[j][0]
+		})
 
 		// No variable found
 		if len(varRow) == 0 {

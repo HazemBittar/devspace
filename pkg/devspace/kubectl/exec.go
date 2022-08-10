@@ -2,15 +2,13 @@ package kubectl
 
 import (
 	"bytes"
+	"context"
 	"github.com/loft-sh/devspace/pkg/util/terminal"
 	"io"
 	"k8s.io/kubectl/pkg/util/term"
-	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
-	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/remotecommand"
-	"k8s.io/client-go/transport/spdy"
 	kubectlExec "k8s.io/client-go/util/exec"
 	"k8s.io/kubectl/pkg/scheme"
 )
@@ -26,23 +24,23 @@ const (
 	SubResourceAttach SubResource = "attach"
 )
 
-// ExecStreamWithTransportOptions are the options used for executing a stream
-type ExecStreamWithTransportOptions struct {
-	ExecStreamOptions
-
-	Transport   http.RoundTripper
-	Upgrader    spdy.Upgrader
-	SubResource SubResource
-}
-
-// ExecStreamWithTransport executes a kubectl exec with given transport round tripper and upgrader
-func (client *client) ExecStreamWithTransport(options *ExecStreamWithTransportOptions) error {
+// execStreamWithTransport executes a kubectl exec with given transport round tripper and upgrader
+func (client *client) execStreamWithTransport(ctx context.Context, options *ExecStreamOptions) error {
 	var (
 		t             term.TTY
 		sizeQueue     remotecommand.TerminalSizeQueue
 		streamOptions remotecommand.StreamOptions
 		tty           = options.TTY
 	)
+
+	if options.SubResource == "" {
+		options.SubResource = SubResourceExec
+	}
+
+	wrapper, upgradeRoundTripper, err := GetUpgraderWrapper(client)
+	if err != nil {
+		return err
+	}
 
 	execRequest := client.KubeClient().CoreV1().RESTClient().Post().
 		Resource("pods").
@@ -100,19 +98,31 @@ func (client *client) ExecStreamWithTransport(options *ExecStreamWithTransportOp
 		}, scheme.ParameterCodec)
 	}
 
-	exec, err := remotecommand.NewSPDYExecutorForTransports(options.Transport, options.Upgrader, "POST", execRequest.URL())
+	exec, err := remotecommand.NewSPDYExecutorForTransports(wrapper, upgradeRoundTripper, "POST", execRequest.URL())
 	if err != nil {
 		return err
 	}
 
-	return t.Safe(func() error {
-		return exec.Stream(streamOptions)
-	})
+	errChan := make(chan error)
+	go func() {
+		errChan <- t.Safe(func() error {
+			return exec.Stream(streamOptions)
+		})
+	}()
+
+	select {
+	case <-ctx.Done():
+		upgradeRoundTripper.Close()
+		<-errChan
+		return nil
+	case err = <-errChan:
+		return err
+	}
 }
 
 // ExecStreamOptions are the options for ExecStream
 type ExecStreamOptions struct {
-	Pod *k8sv1.Pod
+	Pod *corev1.Pod
 
 	Container string
 	Command   []string
@@ -124,29 +134,21 @@ type ExecStreamOptions struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+
+	SubResource SubResource
 }
 
 // ExecStream executes a command and streams the output to the given streams
-func (client *client) ExecStream(options *ExecStreamOptions) error {
-	wrapper, upgradeRoundTripper, err := client.GetUpgraderWrapper()
-	if err != nil {
-		return err
-	}
-
-	return client.ExecStreamWithTransport(&ExecStreamWithTransportOptions{
-		ExecStreamOptions: *options,
-		Transport:         wrapper,
-		Upgrader:          upgradeRoundTripper,
-		SubResource:       SubResourceExec,
-	})
+func (client *client) ExecStream(ctx context.Context, options *ExecStreamOptions) error {
+	return client.execStreamWithTransport(ctx, options)
 }
 
 // ExecBuffered executes a command for kubernetes and returns the output and error buffers
-func (client *client) ExecBuffered(pod *k8sv1.Pod, container string, command []string, stdin io.Reader) ([]byte, []byte, error) {
+func (client *client) ExecBuffered(ctx context.Context, pod *corev1.Pod, container string, command []string, stdin io.Reader) ([]byte, []byte, error) {
 	stdoutBuffer := &bytes.Buffer{}
 	stderrBuffer := &bytes.Buffer{}
 
-	kubeExecError := client.ExecStream(&ExecStreamOptions{
+	kubeExecError := client.ExecStream(ctx, &ExecStreamOptions{
 		Pod:       pod,
 		Container: container,
 		Command:   command,
@@ -155,10 +157,30 @@ func (client *client) ExecBuffered(pod *k8sv1.Pod, container string, command []s
 		Stderr:    stderrBuffer,
 	})
 	if kubeExecError != nil {
-		if _, ok := kubeExecError.(kubectlExec.CodeExitError); ok == false {
+		if _, ok := kubeExecError.(kubectlExec.CodeExitError); !ok {
 			return nil, nil, kubeExecError
 		}
 	}
 
 	return stdoutBuffer.Bytes(), stderrBuffer.Bytes(), kubeExecError
+}
+
+// ExecBufferedCombined starts a new exec request, waits for it to finish and returns the output to the caller
+func (client *client) ExecBufferedCombined(ctx context.Context, pod *corev1.Pod, container string, command []string, stdin io.Reader) ([]byte, error) {
+	stdoutBuffer := &bytes.Buffer{}
+	kubeExecError := client.ExecStream(ctx, &ExecStreamOptions{
+		Pod:       pod,
+		Container: container,
+		Command:   command,
+		Stdin:     stdin,
+		Stdout:    stdoutBuffer,
+		Stderr:    stdoutBuffer,
+	})
+	if kubeExecError != nil {
+		if _, ok := kubeExecError.(kubectlExec.CodeExitError); !ok {
+			return nil, kubeExecError
+		}
+	}
+
+	return stdoutBuffer.Bytes(), kubeExecError
 }

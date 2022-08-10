@@ -15,13 +15,12 @@ images:
   backend-debugger:
     image: john/debugger
 deployments:
-- name: backend
-  helm:
-    componentChart: true
-    values:
-      containers:
-      - image: john/devbackend
-      - image: john/debugger
+  backend:
+    helm:
+      values:
+        containers:
+        - image: john/devbackend
+        - image: john/debugger
 profiles:
 - name: production
   merge:
@@ -33,18 +32,17 @@ profiles:
       backend-debugger: null
     # Override deployments
     deployments:
-    - name: backend
-      helm:
-        componentChart: true
-        values:
-          containers:
-          - image: john/prodbackend
+      backend:
+        helm:
+           values:
+             containers:
+             - image: john/prodbackend
 ```
 **Explanation:**  
 - The above example defines 1 profile: `production`
 - When using the profile `production`, the config is merged with the given merge patch at `profiles[0].merge`.
 - Merge patches follow the rules as defined in [JSON Merge Patch, RFC 7386](https://tools.ietf.org/html/rfc7386):
-  - Arrays are overriden
+  - Arrays are overridden
   - Objects are merged together
   - Keys that have a `null` value are removed from objects
 - The resulting config used in-memory when the profile `production` is used would look like this (you can check via `devspace print -p production`):
@@ -55,11 +53,10 @@ images:
   backend:
     image: john/prodbackend
 deployments:
-- name: backend
-  helm:
-    componentChart: true
-    values:
-      containers:
-      - image: john/prodbackend
+  backend:
+    helm:
+      values:
+        containers:
+          - image: john/prodbackend
 ```
 

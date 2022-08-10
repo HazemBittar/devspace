@@ -1,19 +1,15 @@
 package dev
 
 import (
-	"github.com/loft-sh/devspace/pkg/devspace/plugin"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
+	"github.com/loft-sh/devspace/pkg/devspace/pipeline/types"
 	"github.com/loft-sh/devspace/pkg/devspace/server"
-	"github.com/loft-sh/devspace/pkg/devspace/services"
 	"github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/mgutz/ansi"
-	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
-func UI(servicesClient services.Client, port int) error {
-	logger := servicesClient.Log()
-	logger.StartWait("Starting the ui server...")
-	defer logger.StopWait()
-
+func UI(ctx devspacecontext.Context, port int, showUI bool, pipeline types.Pipeline) (*server.Server, error) {
 	var defaultPort *int
 	if port != 0 {
 		defaultPort = &port
@@ -21,119 +17,25 @@ func UI(servicesClient services.Client, port int) error {
 
 	// Create server
 	uiLogger := log.GetFileLogger("ui")
-	serv, err := server.NewServer(servicesClient.Config(), servicesClient.Dependencies(), "localhost", false, servicesClient.KubeClient().CurrentContext(), servicesClient.KubeClient().Namespace(), defaultPort, uiLogger)
-	logger.StopWait()
+	serv, err := server.NewServer(ctx.WithLogger(uiLogger), "localhost", false, defaultPort, pipeline)
 	if err != nil {
-		logger.Warnf("Couldn't start UI server: %v", err)
+		ctx.Log().Warnf("Couldn't start UI server: %v", err)
 	} else {
 		// Start server
-		go func() { serv.ListenAndServe() }()
+		go func() {
+			_ = serv.ListenAndServe()
+		}()
 
-		logger.WriteString("\n#########################################################\n")
-		logger.Infof("DevSpace UI available at: %s", ansi.Color("http://"+serv.Server.Addr, "white+b"))
-		logger.WriteString("#########################################################\n\n")
-	}
-	return nil
-}
+		go func() {
+			<-ctx.Context().Done()
+			_ = serv.Server.Close()
+		}()
 
-func Sync(servicesClient services.Client, interrupt chan error, printSyncLog, verbose bool) error {
-	pluginErr := plugin.ExecutePluginHook("dev.beforeSync")
-	if pluginErr != nil {
-		return pluginErr
-	}
-
-	err := servicesClient.StartSync(interrupt, printSyncLog, verbose, services.DefaultPrefixFn)
-	if err != nil {
-		return errors.Wrap(err, "start sync")
-	}
-
-	// start in dependencies
-	for _, d := range servicesClient.Dependencies() {
-		if d.DependencyConfig().Dev == nil || d.DependencyConfig().Dev.Sync == false {
-			continue
-		}
-		err = d.StartSync(servicesClient.KubeClient(), interrupt, printSyncLog, verbose, servicesClient.Log())
-		if err != nil {
-			return err
+		if showUI {
+			ctx.Log().WriteString(logrus.InfoLevel, "\n#########################################################\n")
+			ctx.Log().Infof("DevSpace UI available at: %s", ansi.Color("http://"+serv.Server.Addr, "white+b"))
+			ctx.Log().WriteString(logrus.InfoLevel, "#########################################################\n\n")
 		}
 	}
-
-	pluginErr = plugin.ExecutePluginHook("dev.afterSync")
-	if pluginErr != nil {
-		return pluginErr
-	}
-
-	return nil
-}
-
-func PortForwarding(servicesClient services.Client, interrupt chan error) error {
-	pluginErr := plugin.ExecutePluginHook("dev.beforePortForwarding")
-	if pluginErr != nil {
-		return pluginErr
-	}
-
-	// start port forwarding
-	err := servicesClient.StartPortForwarding(interrupt)
-	if err != nil {
-		return errors.Errorf("Unable to start portforwarding: %v", err)
-	}
-	for _, d := range servicesClient.Dependencies() {
-		if d.DependencyConfig().Dev == nil || d.DependencyConfig().Dev.Ports == false {
-			continue
-		}
-		err = d.StartPortForwarding(servicesClient.KubeClient(), interrupt, servicesClient.Log())
-		if err != nil {
-			return err
-		}
-	}
-
-	// start reverse port forwarding
-	err = servicesClient.StartReversePortForwarding(interrupt)
-	if err != nil {
-		return errors.Errorf("Unable to start portforwarding: %v", err)
-	}
-	for _, d := range servicesClient.Dependencies() {
-		if d.DependencyConfig().Dev == nil || d.DependencyConfig().Dev.Ports == false {
-			continue
-		}
-		err = d.StartReversePortForwarding(servicesClient.KubeClient(), interrupt, servicesClient.Log())
-		if err != nil {
-			return err
-		}
-	}
-
-	pluginErr = plugin.ExecutePluginHook("dev.afterPortForwarding")
-	if pluginErr != nil {
-		return pluginErr
-	}
-	return nil
-}
-
-func ReplacePods(servicesClient services.Client) error {
-	pluginErr := plugin.ExecutePluginHook("dev.beforeReplacePods")
-	if pluginErr != nil {
-		return pluginErr
-	}
-
-	// replace pods
-	err := servicesClient.ReplacePods()
-	if err != nil {
-		return err
-	}
-	for _, d := range servicesClient.Dependencies() {
-		if d.DependencyConfig().Dev == nil || d.DependencyConfig().Dev.ReplacePods == false {
-			continue
-		}
-		err = d.ReplacePods(servicesClient.KubeClient(), servicesClient.Log())
-		if err != nil {
-			return err
-		}
-	}
-
-	pluginErr = plugin.ExecutePluginHook("dev.afterReplacePods")
-	if pluginErr != nil {
-		return pluginErr
-	}
-
-	return nil
+	return serv, nil
 }

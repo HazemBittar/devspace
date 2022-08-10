@@ -1,17 +1,19 @@
 package log
 
 import (
-	"strings"
-
-	"github.com/loft-sh/devspace/pkg/util/survey"
+	"github.com/loft-sh/devspace/pkg/util/scanner"
 	"github.com/mgutz/ansi"
+	"github.com/olekukonko/tablewriter"
 	"github.com/sirupsen/logrus"
+	"io"
+	"os"
+	"runtime"
 )
 
-var defaultLog Logger = &stdoutLogger{
-	survey: survey.NewSurvey(),
-	level:  logrus.InfoLevel,
-}
+var baseLog = NewStdoutLogger(os.Stdin, stdout, stderr, logrus.InfoLevel)
+var defaultLog = baseLog
+
+//var defaultLog Logger = NewStreamLoggerWithFormat(os.Stdin, logrus.InfoLevel, JsonFormat)
 
 // Discard is a logger implementation that just discards every log statement
 var Discard = &DiscardLogger{}
@@ -19,23 +21,20 @@ var Discard = &DiscardLogger{}
 // PrintLogo prints the devspace logo
 func PrintLogo() {
 	logo := `
-     ____              ____                       
-    |  _ \  _____   __/ ___| _ __   __ _  ___ ___ 
-    | | | |/ _ \ \ / /\___ \| '_ \ / _` + "`" + ` |/ __/ _ \
-    | |_| |  __/\ V /  ___) | |_) | (_| | (_|  __/
-    |____/ \___| \_/  |____/| .__/ \__,_|\___\___|
-                            |_|`
-
-	stdout.Write([]byte(ansi.Color(logo+"\r\n\r\n", "cyan+b")))
+     %########%      
+     %###########%       ____                 _____                      
+         %#########%    |  _ \   ___ __   __ / ___/  ____    ____   ____ ___ 
+         %#########%    | | | | / _ \\ \ / / \___ \ |  _ \  / _  | / __// _ \
+     %#############%    | |_| |(  __/ \ V /  ____) )| |_) )( (_| |( (__(  __/
+     %#############%    |____/  \___|  \_/   \____/ |  __/  \__,_| \___\\___|
+ %###############%                                  |_|
+ %###########%`
+	stdout.Write([]byte(ansi.Color("\r\n"+logo+"\r\n\r\n", "cyan+b")))
 }
 
 // StartFileLogging logs the output of the global logger to the file default.log
 func StartFileLogging() {
-	defaultLogStdout, ok := defaultLog.(*stdoutLogger)
-	if ok {
-		defaultLogStdout.fileLogger = GetFileLogger("default")
-	}
-
+	defaultLog.AddSink(GetFileLogger("default"))
 	OverrideRuntimeErrorHandler(false)
 }
 
@@ -44,82 +43,51 @@ func GetInstance() Logger {
 	return defaultLog
 }
 
-// SetInstance sets the default logger instance
-func SetInstance(logger Logger) {
-	defaultLog = logger
+// GetBaseInstance returns the base stdout logger
+func GetBaseInstance() Logger {
+	return baseLog
 }
 
-// WriteColored writes a message in color
-func writeColored(message string, color string) {
-	defaultLog.Write([]byte(ansi.Color(message, color)))
-}
-
-//SetFakePrintTable is a testing tool that allows overwriting the function PrintTable
-func SetFakePrintTable(fake func(s Logger, header []string, values [][]string)) {
-	fakePrintTable = fake
-}
-
-var fakePrintTable func(s Logger, header []string, values [][]string)
-
-// PrintTable prints a table with header columns and string values
 func PrintTable(s Logger, header []string, values [][]string) {
-	if fakePrintTable != nil {
-		fakePrintTable(s, header, values)
-		return
-	}
+	PrintTableWithOptions(s, header, values, nil)
+}
 
-	columnLengths := make([]int, len(header))
-	for k, v := range header {
-		columnLengths[k] = len(v)
-	}
+// PrintTableWithOptions prints a table with header columns and string values
+func PrintTableWithOptions(s Logger, header []string, values [][]string, modify func(table *tablewriter.Table)) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
 
-	// Get maximum column length
-	for _, v := range values {
-		for key, value := range v {
-			if len(value) > 64 {
-				value = value[:61] + "..."
-				v[key] = value
-			}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
 
-			if len(value) > columnLengths[key] {
-				columnLengths[key] = len(value)
-			}
+		sa := scanner.NewScanner(reader)
+		for sa.Scan() {
+			s.WriteString(logrus.InfoLevel, "  "+sa.Text()+"\n")
 		}
-	}
+	}()
 
-	s.Write([]byte("\n"))
-
-	// Print Header
-	for key, value := range header {
-		writeColored(" "+value+"  ", "green+b")
-
-		padding := columnLengths[key] - len(value)
-
-		if padding > 0 {
-			s.Write([]byte(strings.Repeat(" ", padding)))
+	table := tablewriter.NewWriter(writer)
+	table.SetHeader(header)
+	if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+		colors := []tablewriter.Colors{}
+		for range header {
+			colors = append(colors, tablewriter.Color(tablewriter.FgGreenColor))
 		}
+		table.SetHeaderColor(colors...)
 	}
 
-	s.Write([]byte("\n"))
-
-	if len(values) == 0 {
-		s.Write([]byte(" No entries found\n"))
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetBorders(tablewriter.Border{Left: false, Top: false, Right: false, Bottom: false})
+	table.AppendBulk(values)
+	if modify != nil {
+		modify(table)
 	}
 
-	// Print Values
-	for _, v := range values {
-		for key, value := range v {
-			s.Write([]byte(" " + value + "  "))
-
-			padding := columnLengths[key] - len(value)
-
-			if padding > 0 {
-				s.Write([]byte(strings.Repeat(" ", padding)))
-			}
-		}
-
-		s.Write([]byte("\n"))
-	}
-
-	s.Write([]byte("\n"))
+	// Render
+	_, _ = writer.Write([]byte("\n"))
+	table.Render()
+	_, _ = writer.Write([]byte("\n"))
+	_ = writer.Close()
+	<-done
 }

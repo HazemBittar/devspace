@@ -1,9 +1,11 @@
 package variable
 
 import (
+	"context"
+	"os"
+
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	"github.com/pkg/errors"
-	"os"
 )
 
 // NewEnvVariable creates a new variable that is loaded without definition
@@ -17,7 +19,7 @@ type envVariable struct {
 	name string
 }
 
-func (e *envVariable) Load(definition *latest.Variable) (interface{}, error) {
+func (e *envVariable) Load(ctx context.Context, definition *latest.Variable) (interface{}, error) {
 	// Check environment
 	value := os.Getenv(e.name)
 

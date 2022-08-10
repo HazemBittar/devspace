@@ -3,16 +3,17 @@ package sync
 import (
 	"archive/tar"
 	"compress/gzip"
-	"github.com/loft-sh/devspace/helper/server/ignoreparser"
+	"github.com/loft-sh/devspace/pkg/util/fsutil"
 	"io"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/loft-sh/devspace/helper/server/ignoreparser"
 
 	"github.com/loft-sh/devspace/pkg/util/log"
 
@@ -53,7 +54,7 @@ func (u *Unarchiver) Untar(fromReader io.ReadCloser, toPath string) error {
 		shouldContinue, err := u.untarNext(toPath, tarReader)
 		if err != nil {
 			return errors.Wrapf(err, "decompress %s", toPath)
-		} else if shouldContinue == false {
+		} else if !shouldContinue {
 			return nil
 		}
 
@@ -83,7 +84,7 @@ func (u *Unarchiver) untarNext(destPath string, tarReader *tar.Reader) (bool, er
 
 	// Check if newer file is there and then don't override?
 	stat, err := os.Stat(outFileName)
-	if err == nil && u.forceOverride == false {
+	if err == nil && !u.forceOverride {
 		if stat.ModTime().Unix() > header.FileInfo().ModTime().Unix() {
 			// Update filemap otherwise we download and download again
 			u.syncConfig.fileIndex.fileMap[relativePath] = &FileInformation{
@@ -94,7 +95,7 @@ func (u *Unarchiver) untarNext(destPath string, tarReader *tar.Reader) (bool, er
 				IsDirectory: stat.IsDir(),
 			}
 
-			if stat.IsDir() == false {
+			if !stat.IsDir() {
 				u.syncConfig.log.Infof("Downstream - Don't override %s because file has newer mTime timestamp", relativePath)
 			}
 			return true, nil
@@ -152,25 +153,6 @@ func (u *Unarchiver) untarNext(destPath string, tarReader *tar.Reader) (bool, er
 	// Set mod time correctly
 	_ = os.Chtimes(outFileName, time.Now(), header.ModTime)
 
-	// Execute command if defined
-	if u.syncConfig.Options.FileChangeCmd != "" {
-		cmdArgs := make([]string, 0, len(u.syncConfig.Options.FileChangeArgs))
-		for _, arg := range u.syncConfig.Options.FileChangeArgs {
-			if arg == "{}" {
-				cmdArgs = append(cmdArgs, outFileName)
-			} else {
-				cmdArgs = append(cmdArgs, arg)
-			}
-		}
-
-		cmd := exec.Command(u.syncConfig.Options.FileChangeCmd, cmdArgs...)
-		cmd.Dir = u.syncConfig.LocalPath
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			return false, errors.Errorf("Error executing command '%s %s': %s => %v", u.syncConfig.Options.FileChangeCmd, strings.Join(cmdArgs, " "), string(out), err)
-		}
-	}
-
 	// Update fileMap so that upstream does not upload the file
 	u.syncConfig.fileIndex.fileMap[relativePath] = &FileInformation{
 		Name:        relativePath,
@@ -200,24 +182,6 @@ func (u *Unarchiver) createAllFolders(name string, perm os.FileMode) error {
 			}
 
 			return errors.Errorf("Error creating %s: %v", dirToCreate, err)
-		}
-
-		if u.syncConfig.Options.DirCreateCmd != "" {
-			cmdArgs := make([]string, 0, len(u.syncConfig.Options.DirCreateArgs))
-			for _, arg := range u.syncConfig.Options.DirCreateArgs {
-				if arg == "{}" {
-					cmdArgs = append(cmdArgs, dirToCreate)
-				} else {
-					cmdArgs = append(cmdArgs, arg)
-				}
-			}
-
-			cmd := exec.Command(u.syncConfig.Options.DirCreateCmd, cmdArgs...)
-			cmd.Dir = u.syncConfig.LocalPath
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				return errors.Errorf("Error executing command '%s %s': %s => %v", u.syncConfig.Options.DirCreateCmd, strings.Join(cmdArgs, " "), string(out), err)
-			}
 		}
 	}
 
@@ -263,7 +227,7 @@ func (a *Archiver) AddToArchive(relativePath string) error {
 	}
 
 	// Exclude files on the exclude list if it does not have a negate pattern, otherwise we will check below
-	if a.ignoreMatcher != nil && a.ignoreMatcher.RequireFullScan() == false && a.ignoreMatcher.Matches(relativePath, stat.IsDir()) {
+	if a.ignoreMatcher != nil && !a.ignoreMatcher.RequireFullScan() && a.ignoreMatcher.Matches(relativePath, stat.IsDir()) {
 		return nil
 	}
 
@@ -274,7 +238,7 @@ func (a *Archiver) AddToArchive(relativePath string) error {
 	}
 
 	// exclude file?
-	if a.ignoreMatcher == nil || a.ignoreMatcher.RequireFullScan() == false || a.ignoreMatcher.Matches(relativePath, false) == false {
+	if a.ignoreMatcher == nil || !a.ignoreMatcher.RequireFullScan() || !a.ignoreMatcher.Matches(relativePath, false) {
 		return a.tarFile(fileInformation, stat)
 	}
 
@@ -282,8 +246,8 @@ func (a *Archiver) AddToArchive(relativePath string) error {
 }
 
 func (a *Archiver) tarFolder(target *FileInformation, targetStat os.FileInfo) error {
-	filepath := path.Join(a.basePath, target.Name)
-	files, err := ioutil.ReadDir(filepath)
+	filePath := path.Join(a.basePath, target.Name)
+	files, err := ioutil.ReadDir(filePath)
 	if err != nil {
 		// config.Logf("[Upstream] Couldn't read dir %s: %s\n", filepath, err.Error())
 		return nil
@@ -291,9 +255,9 @@ func (a *Archiver) tarFolder(target *FileInformation, targetStat os.FileInfo) er
 
 	if len(files) == 0 && target.Name != "" {
 		// check if not excluded
-		if a.ignoreMatcher == nil || a.ignoreMatcher.RequireFullScan() == false || a.ignoreMatcher.Matches(target.Name, true) == false {
+		if a.ignoreMatcher == nil || !a.ignoreMatcher.RequireFullScan() || !a.ignoreMatcher.Matches(target.Name, true) {
 			// Case empty directory
-			hdr, _ := tar.FileInfoHeader(targetStat, filepath)
+			hdr, _ := tar.FileInfoHeader(targetStat, filePath)
 			hdr.Uid = 0
 			hdr.Gid = 0
 			hdr.Mode = fillGo18FileTypeBits(int64(chmodTarEntry(os.FileMode(hdr.Mode))), targetStat)
@@ -307,6 +271,10 @@ func (a *Archiver) tarFolder(target *FileInformation, targetStat os.FileInfo) er
 	}
 
 	for _, f := range files {
+		if fsutil.IsRecursiveSymlink(f, path.Join(filePath, f.Name())) {
+			continue
+		}
+
 		if err := a.AddToArchive(path.Join(target.Name, f.Name())); err != nil {
 			return errors.Wrap(err, "recursive tar "+f.Name())
 		}
@@ -322,6 +290,12 @@ func (a *Archiver) tarFile(target *FileInformation, targetStat os.FileInfo) erro
 		if filepath, err = os.Readlink(filepath); err != nil {
 			return nil
 		}
+
+		targetStat, err = os.Stat(filepath)
+		if err != nil || targetStat.IsDir() {
+			// We ignore open file and just treat it as okay
+			return nil
+		}
 	}
 
 	// Case regular file
@@ -330,7 +304,6 @@ func (a *Archiver) tarFile(target *FileInformation, targetStat os.FileInfo) erro
 		// We ignore open file and just treat it as okay
 		return nil
 	}
-
 	defer f.Close()
 
 	hdr, err := tar.FileInfoHeader(targetStat, filepath)
@@ -352,7 +325,8 @@ func (a *Archiver) tarFile(target *FileInformation, targetStat os.FileInfo) erro
 		return nil
 	}
 
-	if copied, err := io.CopyN(a.writer, f, targetStat.Size()); err != nil {
+	copied, err := io.CopyN(a.writer, f, targetStat.Size())
+	if err != nil {
 		return errors.Wrap(err, "tar copy file")
 	} else if copied != targetStat.Size() {
 		return errors.New("tar: file truncated during read")

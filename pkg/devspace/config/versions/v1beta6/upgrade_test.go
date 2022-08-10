@@ -7,7 +7,7 @@ import (
 	next "github.com/loft-sh/devspace/pkg/devspace/config/versions/v1beta7"
 	"github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/loft-sh/devspace/pkg/util/ptr"
-	yaml "gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v3"
 )
 
 type testCase struct {
@@ -25,11 +25,11 @@ func TestSimple(t *testing.T) {
 			in: &Config{
 				Dev: &DevConfig{
 					Sync: []*SyncConfig{
-						&SyncConfig{},
-						&SyncConfig{
+						{},
+						{
 							DownloadOnInitialSync: ptr.Bool(true),
 						},
-						&SyncConfig{
+						{
 							DownloadOnInitialSync: ptr.Bool(false),
 						},
 					},
@@ -38,11 +38,11 @@ func TestSimple(t *testing.T) {
 			expected: &next.Config{
 				Dev: &next.DevConfig{
 					Sync: []*next.SyncConfig{
-						&next.SyncConfig{},
-						&next.SyncConfig{
+						{},
+						{
 							InitialSync: next.InitialSyncStrategyPreferLocal,
 						},
-						&next.SyncConfig{},
+						{},
 					},
 				},
 			},
@@ -50,22 +50,22 @@ func TestSimple(t *testing.T) {
 		{
 			in: &Config{
 				Images: map[string]*ImageConfig{
-					"test": &ImageConfig{
+					"test": {
 						Image: "test",
 						Tag:   "ttt",
 					},
-					"test2": &ImageConfig{
+					"test2": {
 						Image: "test2",
 					},
 				},
 			},
 			expected: &next.Config{
 				Images: map[string]*next.ImageConfig{
-					"test": &next.ImageConfig{
+					"test": {
 						Image: "test",
 						Tags:  []string{"ttt"},
 					},
-					"test2": &next.ImageConfig{
+					"test2": {
 						Image: "test2",
 					},
 				},

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/loft-sh/devspace/pkg/util/fsutil"
+
 	"github.com/pkg/errors"
 )
 
@@ -35,7 +37,7 @@ func untarAll(reader io.ReadCloser, options *UpstreamOptions) error {
 		shouldContinue, err := untarNext(tarReader, options)
 		if err != nil {
 			return errors.Wrap(err, "decompress")
-		} else if shouldContinue == false {
+		} else if !shouldContinue {
 			return nil
 		}
 	}
@@ -211,8 +213,12 @@ func tarFolder(basePath string, fileInformation *fileInformation, writtenFiles m
 		writtenFiles[fileInformation.Name] = true
 	}
 
-	if skipContents == false {
+	if !skipContents {
 		for _, f := range files {
+			if fsutil.IsRecursiveSymlink(f, path.Join(fileInformation.Name, f.Name())) {
+				continue
+			}
+
 			if err := recursiveTar(basePath, path.Join(fileInformation.Name, f.Name()), writtenFiles, tw, skipContents); err != nil {
 				return errors.Wrap(err, "recursive tar")
 			}
@@ -270,7 +276,7 @@ func tarFile(basePath string, fileInformation *fileInformation, writtenFiles map
 }
 
 func getRelativeFromFullPath(fullpath string, prefix string) string {
-	return strings.TrimPrefix(strings.Replace(strings.Replace(fullpath[len(prefix):], "\\", "/", -1), "//", "/", -1), ".")
+	return strings.TrimPrefix(strings.ReplaceAll(strings.ReplaceAll(fullpath[len(prefix):], "\\", "/"), "//", "/"), ".")
 }
 
 func createFileInformationFromStat(relativePath string, stat os.FileInfo) *fileInformation {

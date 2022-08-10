@@ -41,8 +41,12 @@ Deletes all locally created docker images from docker
 // RunCleanupImages executes the cleanup images command logic
 func (cmd *imagesCmd) RunCleanupImages(f factory.Factory, cobraCmd *cobra.Command, args []string) error {
 	// Set config root
+	ctx := context.Background()
 	log := f.GetLog()
-	configLoader := f.NewConfigLoader(cmd.ConfigPath)
+	configLoader, err := f.NewConfigLoader(cmd.ConfigPath)
+	if err != nil {
+		return err
+	}
 	kubeConfigLoader := f.NewKubeConfigLoader()
 	configExists, err := configLoader.SetDevSpaceRoot(log)
 	if err != nil {
@@ -62,13 +66,13 @@ func (cmd *imagesCmd) RunCleanupImages(f factory.Factory, cobraCmd *cobra.Comman
 	}
 
 	// Create docker client
-	client, err := docker.NewClientWithMinikube(kubeContext, true, log)
+	client, err := docker.NewClientWithMinikube(ctx, kubeContext, true, log)
 	if err != nil {
 		return err
 	}
 
 	// Load config
-	configInterface, err := configLoader.Load(cmd.ToConfigOptions(log), log)
+	configInterface, err := configLoader.Load(ctx, nil, cmd.ToConfigOptions(), log)
 	if err != nil {
 		return err
 	}
@@ -79,18 +83,16 @@ func (cmd *imagesCmd) RunCleanupImages(f factory.Factory, cobraCmd *cobra.Comman
 		return nil
 	}
 
-	_, err = client.Ping(context.Background())
+	_, err = client.Ping(ctx)
 	if err != nil {
 		return errors.Errorf("Docker seems to be not running: %v", err)
 	}
 
-	defer log.StopWait()
-
 	// Delete all images
 	for _, imageConfig := range config.Images {
-		log.StartWait("Deleting local image " + imageConfig.Image)
+		log.Info("Deleting local image " + imageConfig.Image + "...")
 
-		response, err := client.DeleteImageByName(imageConfig.Image, log)
+		response, err := client.DeleteImageByName(ctx, imageConfig.Image, log)
 		if err != nil {
 			return err
 		}
@@ -104,11 +106,11 @@ func (cmd *imagesCmd) RunCleanupImages(f factory.Factory, cobraCmd *cobra.Comman
 		}
 	}
 
-	log.StartWait("Deleting local dangling images")
+	log.Info("Deleting local dangling images...")
 
 	// Cleanup dangling images aswell
 	for {
-		response, err := client.DeleteImageByFilter(filters.NewArgs(filters.Arg("dangling", "true")), log)
+		response, err := client.DeleteImageByFilter(ctx, filters.NewArgs(filters.Arg("dangling", "true")), log)
 		if err != nil {
 			return err
 		}
@@ -126,7 +128,6 @@ func (cmd *imagesCmd) RunCleanupImages(f factory.Factory, cobraCmd *cobra.Comman
 		}
 	}
 
-	log.StopWait()
 	log.Donef("Successfully cleaned up images")
 	return nil
 }

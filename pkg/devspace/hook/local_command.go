@@ -1,18 +1,24 @@
 package hook
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	runtimevar "github.com/loft-sh/devspace/pkg/devspace/config/loader/variable/runtime"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
+	"github.com/loft-sh/devspace/pkg/devspace/pipeline/engine"
+	"github.com/loft-sh/devspace/pkg/devspace/pipeline/env"
+	"io"
+	"os"
+	"regexp"
+	"strings"
+
 	"github.com/loft-sh/devspace/pkg/devspace/config"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	"github.com/loft-sh/devspace/pkg/devspace/dependency/types"
-	"github.com/loft-sh/devspace/pkg/devspace/deploy/deployer/util"
 	"github.com/loft-sh/devspace/pkg/util/command"
-	logpkg "github.com/loft-sh/devspace/pkg/util/log"
-	"github.com/loft-sh/devspace/pkg/util/shell"
 	"github.com/pkg/errors"
-	"io"
-	"os"
-	"path/filepath"
 )
 
 func NewLocalCommandHook(stdout io.Writer, stderr io.Writer) Hook {
@@ -27,7 +33,9 @@ type localCommandHook struct {
 	Stderr io.Writer
 }
 
-func (l *localCommandHook) Execute(ctx Context, hook *latest.HookConfig, config config.Config, dependencies []types.Dependency, log logpkg.Logger) error {
+var EnvironmentVariableRegEx = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+func (l *localCommandHook) Execute(ctx devspacecontext.Context, hook *latest.HookConfig, cmdExtraEnv map[string]string) error {
 	// Create extra env variables
 	osArgsBytes, err := json.Marshal(os.Args)
 	if err != nil {
@@ -36,33 +44,48 @@ func (l *localCommandHook) Execute(ctx Context, hook *latest.HookConfig, config 
 	extraEnv := map[string]string{
 		OsArgsEnv: string(osArgsBytes),
 	}
-	if ctx.Client != nil {
-		extraEnv[KubeContextEnv] = ctx.Client.CurrentContext()
-		extraEnv[KubeNamespaceEnv] = ctx.Client.Namespace()
+	if ctx.KubeClient() != nil {
+		extraEnv[KubeContextEnv] = ctx.KubeClient().CurrentContext()
+		extraEnv[KubeNamespaceEnv] = ctx.KubeClient().Namespace()
 	}
-	if ctx.Error != nil {
-		extraEnv[ErrorEnv] = ctx.Error.Error()
+	for k, v := range cmdExtraEnv {
+		extraEnv[k] = v
 	}
-	dir := filepath.Dir(config.Path())
+	for k, v := range ctx.Config().Variables() {
+		if !EnvironmentVariableRegEx.MatchString(k) {
+			continue
+		}
+
+		extraEnv[k] = fmt.Sprintf("%v", v)
+	}
 
 	// resolve hook command and args
-	hookCommand, hookArgs, err := resolveCommand(hook.Command, hook.Args, config, dependencies)
+	hookCommand, hookArgs, err := ResolveCommand(ctx.Context(), hook.Command, hook.Args, ctx.WorkingDir(), ctx.Config(), ctx.Dependencies())
 	if err != nil {
 		return err
 	}
 
 	// if args are nil we execute the command in a shell
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	defer func() {
+		if hook.Name != "" {
+			ctx.Config().SetRuntimeVariable("hooks."+hook.Name+".stdout", strings.TrimSpace(stdout.String()))
+			ctx.Config().SetRuntimeVariable("hooks."+hook.Name+".stderr", strings.TrimSpace(stderr.String()))
+		}
+	}()
+
 	if hook.Args == nil {
-		return shell.ExecuteShellCommand(hookCommand, nil, dir, l.Stdout, l.Stderr, extraEnv)
+		return engine.ExecuteSimpleShellCommand(ctx.Context(), ctx.WorkingDir(), env.NewVariableEnvProvider(ctx.Environ(), extraEnv), io.MultiWriter(l.Stdout, stdout), io.MultiWriter(l.Stderr, stderr), nil, hookCommand)
 	}
 
 	// else we execute it directly
-	return command.ExecuteCommandWithEnv(hookCommand, hookArgs, dir, l.Stdout, l.Stderr, extraEnv)
+	return command.Command(ctx.Context(), ctx.WorkingDir(), env.NewVariableEnvProvider(ctx.Environ(), extraEnv), io.MultiWriter(l.Stdout, stdout), io.MultiWriter(l.Stderr, stderr), nil, hookCommand, hookArgs...)
 }
 
-func resolveCommand(command string, args []string, config config.Config, dependencies []types.Dependency) (string, []string, error) {
+func ResolveCommand(ctx context.Context, command string, args []string, dir string, config config.Config, dependencies []types.Dependency) (string, []string, error) {
 	// resolve hook command
-	hookCommand, err := util.ResolveImageHelpers(command, config, dependencies)
+	hookCommand, err := runtimevar.NewRuntimeResolver(dir, true).FillRuntimeVariablesAsString(ctx, command, config, dependencies)
 	if err != nil {
 		return "", nil, errors.Wrap(err, "resolve image helpers")
 	}
@@ -71,7 +94,7 @@ func resolveCommand(command string, args []string, config config.Config, depende
 	if args != nil {
 		newArgs := []string{}
 		for _, a := range args {
-			newArg, err := util.ResolveImageHelpers(a, config, dependencies)
+			newArg, err := runtimevar.NewRuntimeResolver(dir, true).FillRuntimeVariablesAsString(ctx, a, config, dependencies)
 			if err != nil {
 				return "", nil, errors.Wrap(err, "resolve image helpers")
 			}

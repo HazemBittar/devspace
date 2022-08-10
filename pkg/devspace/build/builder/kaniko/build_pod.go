@@ -1,11 +1,13 @@
 package kaniko
 
 import (
-	"context"
+	"github.com/loft-sh/devspace/pkg/devspace/build/builder/kaniko/util"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
+	"path/filepath"
+
 	"github.com/docker/distribution/reference"
 	jsonyaml "github.com/ghodss/yaml"
-	"gopkg.in/yaml.v2"
-	"path/filepath"
+	"gopkg.in/yaml.v3"
 
 	"github.com/docker/docker/api/types"
 	"github.com/pkg/errors"
@@ -22,7 +24,7 @@ import (
 const kanikoInitImage = "alpine"
 
 // The kaniko build image we use by default
-const kanikoBuildImage = "gcr.io/kaniko-project/executor:v1.5.2"
+const kanikoBuildImage = "gcr.io/kaniko-project/executor:v1.8.1"
 
 // The context path within the kaniko pod
 const kanikoContextPath = "/context"
@@ -49,8 +51,8 @@ var defaultResources = &availableResources{
 	EphemeralStorage: resource.MustParse("10Gi"),
 }
 
-func (b *Builder) getBuildPod(buildID string, options *types.ImageBuildOptions, dockerfilePath string) (*k8sv1.Pod, error) {
-	kanikoOptions := b.helper.ImageConf.Build.Kaniko
+func (b *Builder) getBuildPod(ctx devspacecontext.Context, buildID string, options *types.ImageBuildOptions, dockerfilePath string) (*k8sv1.Pod, error) {
+	kanikoOptions := b.helper.ImageConf.Kaniko
 
 	registryURL, err := pullsecrets.GetRegistryFromImageName(b.FullImageName)
 	if err != nil {
@@ -107,7 +109,7 @@ func (b *Builder) getBuildPod(buildID string, options *types.ImageBuildOptions, 
 	}
 
 	// cache flags
-	if kanikoOptions.Cache == nil || *kanikoOptions.Cache == true {
+	if kanikoOptions.Cache {
 		ref, err := reference.ParseNormalizedNamed(b.FullImageName)
 		if err != nil {
 			return nil, err
@@ -208,7 +210,6 @@ func (b *Builder) getBuildPod(buildID string, options *types.ImageBuildOptions, 
 			SubPath:   mount.SubPath,
 		})
 	}
-
 	// create the build pod
 	pod := &k8sv1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -217,6 +218,7 @@ func (b *Builder) getBuildPod(buildID string, options *types.ImageBuildOptions, 
 			Labels: map[string]string{
 				"devspace-build":    "true",
 				"devspace-build-id": buildID,
+				"devspace-pid":      ctx.RunID(),
 			},
 		},
 		Spec: k8sv1.PodSpec{
@@ -246,6 +248,7 @@ func (b *Builder) getBuildPod(buildID string, options *types.ImageBuildOptions, 
 				},
 			},
 			NodeSelector:       kanikoOptions.NodeSelector,
+			Tolerations:        kanikoOptions.Tolerations,
 			ServiceAccountName: kanikoOptions.ServiceAccount,
 			Volumes:            volumes,
 			RestartPolicy:      k8sv1.RestartPolicyNever,
@@ -310,7 +313,7 @@ func (b *Builder) getBuildPod(buildID string, options *types.ImageBuildOptions, 
 	// check if we have specific options for the resources part
 	if kanikoOptions.Resources == nil {
 		// get available resources
-		availableResources, err := b.getAvailableResources()
+		availableResources, err := b.getAvailableResources(ctx)
 		if err != nil {
 			return nil, err
 		} else if availableResources != nil {
@@ -335,11 +338,11 @@ func (b *Builder) getBuildPod(buildID string, options *types.ImageBuildOptions, 
 		}
 	} else {
 		// convert resources
-		limits, err := ConvertMap(kanikoOptions.Resources.Limits)
+		limits, err := util.ConvertMap(kanikoOptions.Resources.Limits)
 		if err != nil {
 			return nil, errors.Wrap(err, "limits")
 		}
-		requests, err := ConvertMap(kanikoOptions.Resources.Requests)
+		requests, err := util.ConvertMap(kanikoOptions.Resources.Requests)
 		if err != nil {
 			return nil, errors.Wrap(err, "requests")
 		}
@@ -358,27 +361,9 @@ func (b *Builder) getBuildPod(buildID string, options *types.ImageBuildOptions, 
 	return pod, nil
 }
 
-func ConvertMap(m map[string]string) (map[k8sv1.ResourceName]resource.Quantity, error) {
-	if m == nil {
-		return nil, nil
-	}
-
-	retMap := map[k8sv1.ResourceName]resource.Quantity{}
-	for k, v := range m {
-		pv, err := resource.ParseQuantity(v)
-		if err != nil {
-			return nil, errors.Wrapf(err, "parse kaniko pod resource quantity %s", k)
-		}
-
-		retMap[k8sv1.ResourceName(k)] = pv
-	}
-
-	return retMap, nil
-}
-
 // Determine available resources (This is only necessary in the devspace cloud)
-func (b *Builder) getAvailableResources() (*availableResources, error) {
-	quota, err := b.helper.KubeClient.KubeClient().CoreV1().ResourceQuotas(b.BuildNamespace).Get(context.TODO(), devspaceQuota, metav1.GetOptions{})
+func (b *Builder) getAvailableResources(ctx devspacecontext.Context) (*availableResources, error) {
+	quota, err := ctx.KubeClient().KubeClient().CoreV1().ResourceQuotas(b.BuildNamespace).Get(ctx.Context(), devspaceQuota, metav1.GetOptions{})
 	if err != nil {
 		return nil, nil
 	}
@@ -404,7 +389,7 @@ func (b *Builder) getAvailableResources() (*availableResources, error) {
 	}
 
 	// Get limitrange
-	limitrange, err := b.helper.KubeClient.KubeClient().CoreV1().LimitRanges(b.BuildNamespace).Get(context.TODO(), devspaceLimitRange, metav1.GetOptions{})
+	limitrange, err := ctx.KubeClient().KubeClient().CoreV1().LimitRanges(b.BuildNamespace).Get(ctx.Context(), devspaceLimitRange, metav1.GetOptions{})
 	if err != nil {
 		return availableResources, nil
 	}

@@ -8,7 +8,6 @@ import (
 
 	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
 	"github.com/loft-sh/devspace/pkg/devspace/services/targetselector"
-	"github.com/loft-sh/devspace/pkg/util/imageselector"
 	"github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/loft-sh/devspace/pkg/util/randutil"
 	corev1 "k8s.io/api/core/v1"
@@ -41,19 +40,17 @@ func (k *KubeHelper) RawClient() kubernetes.Interface {
 }
 
 func (k *KubeHelper) ExecByImageSelector(imageSelector, namespace string, command []string) (string, error) {
-	targetOptions := targetselector.NewEmptyOptions().ApplyConfigParameter(nil, namespace, "", "")
-	targetOptions.AllowPick = false
-	targetOptions.Timeout = 120
-	targetOptions.ImageSelector = []imageselector.ImageSelector{imageselector.ImageSelector{
-		Image: imageSelector,
-	}}
-	targetOptions.WaitingStrategy = targetselector.NewUntilNewestRunningWaitingStrategy(time.Second * 2)
-	container, err := targetselector.NewTargetSelector(k.client).SelectSingleContainer(context.TODO(), targetOptions, log.Discard)
+	targetOptions := targetselector.NewOptionsFromFlags("", "", []string{imageSelector}, namespace, "").
+		WithTimeout(120).
+		WithWaitingStrategy(targetselector.NewUntilNewestRunningWaitingStrategy(time.Second * 2))
+
+	globalTargetSelector := targetselector.NewTargetSelector(targetOptions)
+	container, err := globalTargetSelector.SelectSingleContainer(context.TODO(), k.client, log.Discard)
 	if err != nil {
 		return "", err
 	}
 
-	stdout, stderr, err := k.client.ExecBuffered(container.Pod, container.Container.Name, command, nil)
+	stdout, stderr, err := k.client.ExecBuffered(context.TODO(), container.Pod, container.Container.Name, command, nil)
 	if err != nil {
 		return "", fmt.Errorf("exec error: %v %s", err, string(stderr))
 	}
@@ -62,18 +59,17 @@ func (k *KubeHelper) ExecByImageSelector(imageSelector, namespace string, comman
 }
 
 func (k *KubeHelper) ExecByContainer(labelSelector, containerName, namespace string, command []string) (string, error) {
-	targetOptions := targetselector.NewEmptyOptions().ApplyConfigParameter(nil, namespace, "", "")
-	targetOptions.AllowPick = false
-	targetOptions.Timeout = 120
-	targetOptions.LabelSelector = labelSelector
-	targetOptions.ContainerName = containerName
-	targetOptions.WaitingStrategy = targetselector.NewUntilNewestRunningWaitingStrategy(time.Second * 2)
-	container, err := targetselector.NewTargetSelector(k.client).SelectSingleContainer(context.TODO(), targetOptions, log.Discard)
+	targetOptions := targetselector.NewOptionsFromFlags(containerName, labelSelector, nil, namespace, "").
+		WithTimeout(120).
+		WithWaitingStrategy(targetselector.NewUntilNewestRunningWaitingStrategy(time.Second * 2))
+
+	globalTargetSelector := targetselector.NewTargetSelector(targetOptions)
+	container, err := globalTargetSelector.SelectSingleContainer(context.TODO(), k.client, log.Discard)
 	if err != nil {
 		return "", err
 	}
 
-	stdout, stderr, err := k.client.ExecBuffered(container.Pod, container.Container.Name, command, nil)
+	stdout, stderr, err := k.client.ExecBuffered(context.TODO(), container.Pod, container.Container.Name, command, nil)
 	if err != nil {
 		return "", fmt.Errorf("exec error: %v %s", err, string(stderr))
 	}
@@ -88,7 +84,7 @@ func (k *KubeHelper) CreateNamespace(name string) (string, error) {
 			Name: name,
 		},
 	}, metav1.CreateOptions{})
-	if err != nil && kerrors.IsAlreadyExists(err) == false {
+	if err != nil && !kerrors.IsAlreadyExists(err) {
 		return "", err
 	}
 
@@ -97,7 +93,7 @@ func (k *KubeHelper) CreateNamespace(name string) (string, error) {
 
 func (k *KubeHelper) DeleteNamespace(name string) error {
 	err := k.client.KubeClient().CoreV1().Namespaces().Delete(context.TODO(), name, metav1.DeleteOptions{})
-	if err != nil && kerrors.IsNotFound(err) == false {
+	if err != nil && !kerrors.IsNotFound(err) {
 		return err
 	}
 	return nil

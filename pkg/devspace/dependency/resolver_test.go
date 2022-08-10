@@ -1,48 +1,44 @@
 package dependency
 
 import (
-	"github.com/loft-sh/devspace/pkg/util/hash"
-	"io/ioutil"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/loft-sh/devspace/pkg/devspace/config"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
 	"github.com/loft-sh/devspace/pkg/devspace/dependency/util"
 
 	"github.com/loft-sh/devspace/pkg/devspace/config/constants"
-	"github.com/loft-sh/devspace/pkg/devspace/config/generated"
 	"github.com/loft-sh/devspace/pkg/devspace/config/loader"
+	"github.com/loft-sh/devspace/pkg/devspace/config/localcache"
+	"github.com/loft-sh/devspace/pkg/devspace/config/remotecache"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	fakekube "github.com/loft-sh/devspace/pkg/devspace/kubectl/testing"
 	"github.com/loft-sh/devspace/pkg/util/fsutil"
-	"github.com/loft-sh/devspace/pkg/util/log"
+	log "github.com/loft-sh/devspace/pkg/util/log/testing"
 
 	"gotest.tools/assert"
 	"k8s.io/client-go/kubernetes/fake"
 
-	yaml "gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v3"
 )
 
 type resolverTestCase struct {
 	name string
 
 	files           map[string]*latest.Config
-	dependencyTasks []*latest.DependencyConfig
-	updateParam     bool
-	allowCyclic     bool
-
+	dependencyTasks map[string]*latest.DependencyConfig
+	// updateParam          bool
+	allowCyclic          bool
 	skipIds              bool
 	expectedDependencies []Dependency
 	expectedErr          string
 }
 
 func TestResolver(t *testing.T) {
-	dir, err := ioutil.TempDir("", "testFolder")
-	if err != nil {
-		t.Fatalf("Error creating temporary directory: %v", err)
-	}
-	dir, err = filepath.EvalSymlinks(dir)
+	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,56 +60,66 @@ func TestResolver(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Error changing dir back: %v", err)
 		}
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Fatalf("Error removing dir: %v", err)
-		}
 	}()
 
 	testCases := []resolverTestCase{
-		resolverTestCase{
+		{
 			name: "No depependency tasks",
 		},
-		resolverTestCase{
+		{
 			name: "Simple local dependency",
 			files: map[string]*latest.Config{
-				"dependency1/devspace.yaml": &latest.Config{
+				"dependency1/devspace.yaml": {
 					Version: latest.Version,
 				},
-				"dependency2/devspace.yaml": &latest.Config{
+				"dependency2/devspace.yaml": {
 					Version: latest.Version,
 				},
 			},
-			dependencyTasks: []*latest.DependencyConfig{
-				&latest.DependencyConfig{
-					Name: "test",
+			dependencyTasks: map[string]*latest.DependencyConfig{
+				"test1": {
+					Name: "test1",
 					Source: &latest.SourceConfig{
 						Path: "dependency1",
 					},
 				},
-				&latest.DependencyConfig{
-					Name: "test",
+				"test2": {
+					Name: "test2",
 					Source: &latest.SourceConfig{
 						Path: "dependency2",
 					},
 				},
 			},
 			expectedDependencies: []Dependency{
-				Dependency{
-					localPath: filepath.Join(dir, "dependency1"),
+				{
+					dependencyConfig: &latest.DependencyConfig{
+						Name: "test1",
+						Source: &latest.SourceConfig{
+							Path: "dependency1",
+						},
+					},
+					name:         "test1",
+					absolutePath: filepath.Join(dir, "dependency1"),
 				},
-				Dependency{
-					localPath: filepath.Join(dir, "dependency2"),
+				{
+					dependencyConfig: &latest.DependencyConfig{
+						Name: "test2",
+						Source: &latest.SourceConfig{
+							Path: "dependency2",
+						},
+					},
+					name:         "test2",
+					absolutePath: filepath.Join(dir, "dependency2"),
 				},
 			},
 		},
-		resolverTestCase{
+		{
 			name: "Simple git dependency",
 			files: map[string]*latest.Config{
-				"dependency1/devspace.yaml": &latest.Config{},
+				"dependency1/devspace.yaml": {},
 			},
-			dependencyTasks: []*latest.DependencyConfig{
-				&latest.DependencyConfig{
+			dependencyTasks: map[string]*latest.DependencyConfig{
+				"test": {
 					Name: "test",
 					Source: &latest.SourceConfig{
 						Git:      "https://github.com/devspace-cloud/example-dependency.git",
@@ -123,38 +129,39 @@ func TestResolver(t *testing.T) {
 				},
 			},
 			expectedDependencies: []Dependency{
-				Dependency{
-					localPath: filepath.Join(util.DependencyFolderPath, hash.String(mustGetDependencyID(dir, &latest.DependencyConfig{
+				{
+					absolutePath: filepath.Join(util.DependencyFolderPath, mustGetDependencyID(&latest.DependencyConfig{
 						Name: "test",
 						Source: &latest.SourceConfig{
 							Git:      "https://github.com/devspace-cloud/example-dependency.git",
 							Revision: "f8b2aa8cf8ac03238a28e8f78382b214d619893f",
 							SubPath:  "mysubpath",
 						},
-					})), "mysubpath"),
+					}), "mysubpath"),
+					name: "test",
 				},
 			},
 		},
-		resolverTestCase{
+		{
 			name:    "Cyclic allowed dependency",
 			skipIds: true,
 			files: map[string]*latest.Config{
-				"dependency2/devspace.yaml": &latest.Config{
+				"dependency2/devspace.yaml": {
 					Version: latest.Version,
-					Dependencies: []*latest.DependencyConfig{
-						&latest.DependencyConfig{
-							Name: "test",
+					Dependencies: map[string]*latest.DependencyConfig{
+						"test2": {
+							Name: "test2",
 							Source: &latest.SourceConfig{
 								Path: "../dependency1",
 							},
 						},
 					},
 				},
-				"dependency1/devspace.yaml": &latest.Config{
+				"dependency1/devspace.yaml": {
 					Version: latest.Version,
-					Dependencies: []*latest.DependencyConfig{
-						&latest.DependencyConfig{
-							Name: "test",
+					Dependencies: map[string]*latest.DependencyConfig{
+						"test1": {
+							Name: "test1",
 							Source: &latest.SourceConfig{
 								Path: "../dependency2",
 							},
@@ -162,8 +169,8 @@ func TestResolver(t *testing.T) {
 					},
 				},
 			},
-			dependencyTasks: []*latest.DependencyConfig{
-				&latest.DependencyConfig{
+			dependencyTasks: map[string]*latest.DependencyConfig{
+				"test": {
 					Name: "test",
 					Source: &latest.SourceConfig{
 						Path: "dependency1",
@@ -172,11 +179,9 @@ func TestResolver(t *testing.T) {
 			},
 			allowCyclic: true,
 			expectedDependencies: []Dependency{
-				Dependency{
-					localPath: filepath.Join(dir, "dependency2"),
-				},
-				Dependency{
-					localPath: filepath.Join(dir, "dependency1"),
+				{
+					absolutePath: filepath.Join(dir, "dependency1"),
+					name:         "test",
 				},
 			},
 		},
@@ -193,15 +198,26 @@ func TestResolver(t *testing.T) {
 		testConfig := &latest.Config{
 			Dependencies: testCase.dependencyTasks,
 		}
-		generatedConfig := &generated.Config{}
+		generatedConfig := localcache.New(constants.DefaultConfigPath)
 		kube := fake.NewSimpleClientset()
 		kubeClient := &fakekube.Client{
 			Client: kube,
 		}
-		testResolver := NewResolver(config.NewConfig(nil, testConfig, generatedConfig, map[string]interface{}{}, constants.DefaultConfigPath), kubeClient, &loader.ConfigOptions{}, log.Discard)
+
+		conf := config.NewConfig(map[string]interface{}{},
+			map[string]interface{}{},
+			testConfig,
+			generatedConfig,
+			&remotecache.RemoteCache{},
+			map[string]interface{}{},
+			constants.DefaultConfigPath)
+
+		devCtx := devspacecontext.NewContext(context.Background(), nil, log.NewFakeLogger()).WithConfig(conf).WithKubeClient(kubeClient)
+
+		testResolver := NewResolver(devCtx, &loader.ConfigOptions{})
 		assert.NilError(t, err, "Error creating a resolver in testCase %s", testCase.name)
 
-		dependencies, err := testResolver.Resolve(testCase.updateParam)
+		dependencies, err := testResolver.Resolve(devCtx, ResolveOptions{})
 		if testCase.expectedErr == "" {
 			assert.NilError(t, err, "Unexpected error in testCase %s", testCase.name)
 		} else {
@@ -210,11 +226,8 @@ func TestResolver(t *testing.T) {
 
 		assert.Equal(t, len(testCase.expectedDependencies), len(dependencies), "Wrong dependency length in testCase %s", testCase.name)
 		for index, expected := range testCase.expectedDependencies {
-			if testCase.skipIds == false {
-				id, _ := util.GetDependencyID(dir, testCase.dependencyTasks[index])
-				assert.Equal(t, id, dependencies[index].id, "Dependency has wrong id in testCase %s", testCase.name)
-			}
-			assert.Equal(t, expected.localPath, dependencies[index].localPath, "Dependency has wrong local path in testCase %s", testCase.name)
+			assert.Equal(t, expected.name, dependencies[index].Name())
+			assert.Equal(t, expected.absolutePath, dependencies[index].Path(), "Dependency has wrong local path in testCase %s", testCase.name)
 		}
 
 		for path := range testCase.files {
@@ -226,75 +239,7 @@ func TestResolver(t *testing.T) {
 	}
 }
 
-func mustGetDependencyID(basePath string, config *latest.DependencyConfig) string {
-	id, _ := util.GetDependencyID(basePath, config)
+func mustGetDependencyID(config *latest.DependencyConfig) string {
+	id, _ := util.GetDependencyID(config.Source)
 	return id
-}
-
-func includes(arr []string, needle string) bool {
-	for _, suspect := range arr {
-		if suspect == needle {
-			return true
-		}
-	}
-	return false
-}
-
-type getDependencyIDTestCase struct {
-	name string
-
-	baseBath   string
-	dependency *latest.DependencyConfig
-
-	expectedID string
-}
-
-func TestGetDependencyID(t *testing.T) {
-	testCases := []getDependencyIDTestCase{
-		getDependencyIDTestCase{
-			name: "git with tag",
-			dependency: &latest.DependencyConfig{
-				Source: &latest.SourceConfig{
-					Git: "someTagGit",
-					Tag: "myTag",
-				},
-			},
-			expectedID: "e8fb9810c53ca0986d12ec5d078e38659a1700425a292cefe4f77bffa351667c",
-		},
-		getDependencyIDTestCase{
-			name: "git with branch",
-			dependency: &latest.DependencyConfig{
-				Source: &latest.SourceConfig{
-					Git:    "someBranchGit",
-					Branch: "myBranch",
-				},
-			},
-			expectedID: "9a5ed87e8fec108a03b592058f7eec3a0b1c9fe431cfe1d03a5d37333fb07b2d",
-		},
-		getDependencyIDTestCase{
-			name: "git with revision, subpath and profile",
-			dependency: &latest.DependencyConfig{
-				Source: &latest.SourceConfig{
-					Git:      "someRevisionGit",
-					Revision: "myRevision",
-					SubPath:  "mySubPath",
-				},
-				Profile: "myProfile",
-			},
-			expectedID: "bb783d78de53d3bcb1533d239a3d1d685070f22b9f25e5c487a83425be586900",
-		},
-		getDependencyIDTestCase{
-			name: "empty",
-			dependency: &latest.DependencyConfig{
-				Source: &latest.SourceConfig{},
-			},
-			expectedID: "cc4af1ccc6f0bba9d05b89a8ac9bfdca135653f86d9535756b8c219bc7fdd9a1",
-		},
-	}
-
-	for _, testCase := range testCases {
-		id, err := util.GetDependencyID(testCase.baseBath, testCase.dependency)
-		assert.NilError(t, err)
-		assert.Equal(t, testCase.expectedID, id, "Dependency has wrong id in testCase %s", testCase.name)
-	}
 }

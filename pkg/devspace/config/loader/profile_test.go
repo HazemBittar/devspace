@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	yaml "gopkg.in/yaml.v3"
 )
 
@@ -26,6 +27,7 @@ func TestTransformPath(t *testing.T) {
 		`deployments[?(@.name=='staging1')]`:                 `deployments[?(@.name=='staging1')]`,
 		`deployments[?(@.helm.timeout > 1000)]`:              `deployments[?(@.helm.timeout > 1000)]`,
 		`deployments.name=backend.helm.values.containers.image=john/devbackend.image`: `deployments[?(@.name=='backend')].helm.values.containers[?(@.image=='john/devbackend')].image`,
+		`dev.ports.name=rails.reverseForward.port=9200`:                               `dev.ports[?(@.name=='rails')].reverseForward[?(@.port=='9200' || @.port==9200)]`,
 	}
 
 	// Run test cases
@@ -39,42 +41,42 @@ func TestTransformPath(t *testing.T) {
 }
 
 type testCase struct {
-	in       map[interface{}]interface{}
-	expected map[interface{}]interface{}
-	profile  map[interface{}]interface{}
+	in       map[string]interface{}
+	expected map[string]interface{}
+	profile  latest.ProfileConfig
 }
 
 func TestPatches(t *testing.T) {
 	testCases := map[string]*testCase{
 		"patch with path": {
-			profile: map[interface{}]interface{}{
-				"name": "test",
-				"patches": []interface{}{
-					map[interface{}]interface{}{
-						"op":   "add",
-						"path": "dev.ports",
-						"value": map[interface{}]interface{}{
+			profile: latest.ProfileConfig{
+				Name: "test",
+				Patches: []*latest.PatchConfig{
+					{
+						Operation: "add",
+						Path:      "dev.ports",
+						Value: map[string]interface{}{
 							"imageName": "myImage",
 						},
 					},
 				},
 			},
-			in: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			in: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName": "test",
 						},
 					},
 				},
 			},
-			expected: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			expected: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName": "test",
 						},
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName": "myImage",
 						},
 					},
@@ -82,29 +84,29 @@ func TestPatches(t *testing.T) {
 			},
 		},
 		"patch with extended matching": {
-			profile: map[interface{}]interface{}{
-				"name": "test",
-				"patches": []interface{}{
-					map[interface{}]interface{}{
-						"op":    "add",
-						"path":  "dev.ports.imageName=test.containerName",
-						"value": "myContainer",
+			profile: latest.ProfileConfig{
+				Name: "test",
+				Patches: []*latest.PatchConfig{
+					{
+						Operation: "add",
+						Path:      "dev.ports.imageName=test.containerName",
+						Value:     "myContainer",
 					},
 				},
 			},
-			in: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			in: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName": "test",
 						},
 					},
 				},
 			},
-			expected: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			expected: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName":     "test",
 							"containerName": "myContainer",
 						},
@@ -113,28 +115,28 @@ func TestPatches(t *testing.T) {
 			},
 		},
 		"skip remove patch when no match": {
-			profile: map[interface{}]interface{}{
-				"name": "test",
-				"patches": []interface{}{
-					map[interface{}]interface{}{
-						"op":   "remove",
-						"path": "dev.ports.imageName=test.containerName",
+			profile: latest.ProfileConfig{
+				Name: "test",
+				Patches: []*latest.PatchConfig{
+					{
+						Operation: "remove",
+						Path:      "dev.ports.imageName=test.containerName",
 					},
 				},
 			},
-			in: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			in: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName": "test",
 						},
 					},
 				},
 			},
-			expected: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			expected: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName": "test",
 						},
 					},
@@ -142,27 +144,27 @@ func TestPatches(t *testing.T) {
 			},
 		},
 		"add patch when replace patch has no match": {
-			profile: map[interface{}]interface{}{
-				"name": "test",
-				"patches": []interface{}{
-					map[interface{}]interface{}{
-						"op":   "replace",
-						"path": "dev.ports",
-						"value": []interface{}{
-							map[interface{}]interface{}{
+			profile: latest.ProfileConfig{
+				Name: "test",
+				Patches: []*latest.PatchConfig{
+					{
+						Operation: "replace",
+						Path:      "dev.ports",
+						Value: []interface{}{
+							map[string]interface{}{
 								"imageName": "test",
 							},
 						},
 					},
 				},
 			},
-			in: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{},
+			in: map[string]interface{}{
+				"dev": map[string]interface{}{},
 			},
-			expected: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			expected: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName": "test",
 						},
 					},
@@ -170,27 +172,27 @@ func TestPatches(t *testing.T) {
 			},
 		},
 		"add patch appends to array without suffix": {
-			profile: map[interface{}]interface{}{
-				"name": "test",
-				"patches": []interface{}{
-					map[interface{}]interface{}{
-						"op":   "add",
-						"path": "dev.ports",
-						"value": map[interface{}]interface{}{
+			profile: latest.ProfileConfig{
+				Name: "test",
+				Patches: []*latest.PatchConfig{
+					{
+						Operation: "add",
+						Path:      "dev.ports",
+						Value: map[string]interface{}{
 							"imageName": "test",
 						},
 					},
 				},
 			},
-			in: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			in: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{},
 				},
 			},
-			expected: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			expected: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName": "test",
 						},
 					},
@@ -198,36 +200,36 @@ func TestPatches(t *testing.T) {
 			},
 		},
 		"test with wildcard match": {
-			profile: map[interface{}]interface{}{
-				"name": "test",
-				"patches": []interface{}{
-					map[interface{}]interface{}{
-						"op":    "add",
-						"path":  "dev.ports.*.containerName",
-						"value": "myContainer",
+			profile: latest.ProfileConfig{
+				Name: "test",
+				Patches: []*latest.PatchConfig{
+					{
+						Operation: "add",
+						Path:      "dev.ports.*.containerName",
+						Value:     "myContainer",
 					},
 				},
 			},
-			in: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			in: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName": "test",
 						},
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName": "myImage",
 						},
 					},
 				},
 			},
-			expected: map[interface{}]interface{}{
-				"dev": map[interface{}]interface{}{
+			expected: map[string]interface{}{
+				"dev": map[string]interface{}{
 					"ports": []interface{}{
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName":     "test",
 							"containerName": "myContainer",
 						},
-						map[interface{}]interface{}{
+						map[string]interface{}{
 							"imageName":     "myImage",
 							"containerName": "myContainer",
 						},
@@ -239,7 +241,7 @@ func TestPatches(t *testing.T) {
 
 	// Run test cases
 	for index, testCase := range testCases {
-		newConfig, err := ApplyPatches(testCase.in, testCase.profile)
+		newConfig, err := ApplyPatches(testCase.in, &testCase.profile)
 		if err != nil {
 			t.Errorf("Error: %v", err)
 		}

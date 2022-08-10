@@ -3,10 +3,12 @@ package targetselector
 import (
 	"context"
 	"fmt"
+	"github.com/loft-sh/devspace/pkg/devspace/imageselector"
+	"time"
+
 	"github.com/loft-sh/devspace/pkg/devspace/kubectl/selector"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"time"
 
 	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
 	"github.com/loft-sh/devspace/pkg/util/log"
@@ -23,105 +25,181 @@ const DefaultContainerQuestion = "Select a container"
 
 // Options holds the options for a target selector
 type Options struct {
-	selector.Selector
+	selector selector.Selector
 
-	AllowPick bool
-	Question  string
+	allowPick bool
+	question  string
 
-	Wait    *bool
-	Timeout int64
+	wait    *bool
+	timeout int64
 
-	FailIfMultiple bool
-	SortPods       selector.SortPods
-	SortContainers selector.SortContainers
+	failIfMultiple bool
+	sortContainers selector.SortContainers
 
-	WaitingStrategy WaitingStrategy
+	waitingStrategy WaitingStrategy
 }
 
 func NewEmptyOptions() Options {
-	return Options{}
+	return Options{
+		selector: selector.Selector{
+			FilterContainer: selector.FilterTerminatingContainers,
+		},
+		sortContainers: selector.SortContainersByNewest,
+	}
 }
 
-func NewDefaultOptions() Options {
+func NewOptionsFromFlags(containerName string, labelSelector string, imageSelector []string, namespace string, pod string) Options {
 	return Options{
-		AllowPick: true,
-		Selector: selector.Selector{
+		selector: selector.Selector{
+			ImageSelector:   imageSelector,
+			LabelSelector:   labelSelector,
+			Pod:             pod,
+			ContainerName:   containerName,
+			Namespace:       namespace,
 			FilterContainer: selector.FilterNonRunningContainers,
 		},
-		SortPods:       selector.SortPodsByNewest,
-		SortContainers: selector.SortContainersByNewest,
+		sortContainers: selector.SortContainersByNewest,
 	}
 }
 
-func NewOptionsFromFlags(containerName string, labelSelector string, namespace string, pod string, allowPick bool) Options {
-	return Options{
-		AllowPick: allowPick,
-		Selector: selector.Selector{
-			LabelSelector:      labelSelector,
-			Pod:                pod,
-			ContainerName:      containerName,
-			Namespace:          namespace,
-			SkipInitContainers: false,
-			FilterContainer:    selector.FilterNonRunningContainers,
-		},
-		SortPods:       selector.SortPodsByNewest,
-		SortContainers: selector.SortContainersByNewest,
-	}
-}
-
-func (o Options) ApplyConfigParameter(labelSelector map[string]string, namespace string, containerName string, pod string) Options {
+func (o Options) WithPod(pod string) Options {
 	newOptions := o
-	if containerName != "" && o.ContainerName == "" {
-		newOptions.ContainerName = containerName
+	newOptions.selector.Pod = pod
+	return newOptions
+}
+
+func (o Options) WithLabelSelector(labelSelector string) Options {
+	newOptions := o
+	newOptions.selector.LabelSelector = labelSelector
+	return newOptions
+}
+
+func (o Options) WithContainer(container string) Options {
+	newOptions := o
+	newOptions.selector.ContainerName = container
+	return newOptions
+}
+
+func (o Options) WithQuestion(question string) Options {
+	newOptions := o
+	newOptions.question = question
+	return newOptions
+}
+
+func (o Options) WithImageSelector(imageSelector []string) Options {
+	newOptions := o
+	newOptions.selector.ImageSelector = imageSelector
+	return newOptions
+}
+
+func (o Options) WithWait(wait bool) Options {
+	newOptions := o
+	newOptions.wait = &wait
+	return newOptions
+}
+
+func (o Options) WithTimeout(timeout int64) Options {
+	newOptions := o
+	newOptions.timeout = timeout
+	return newOptions
+}
+
+func (o Options) WithNamespace(namespace string) Options {
+	newOptions := o
+	newOptions.selector.Namespace = namespace
+	return newOptions
+}
+
+func (o Options) WithSkipInitContainers(skip bool) Options {
+	newOptions := o
+	newOptions.selector.SkipInitContainers = skip
+	return newOptions
+}
+
+func (o Options) WithContainerFilter(containerFilter selector.FilterContainer) Options {
+	newOptions := o
+	newOptions.selector.FilterContainer = containerFilter
+	return newOptions
+}
+
+func (o Options) WithWaitingStrategy(waitingStrategy WaitingStrategy) Options {
+	newOptions := o
+	newOptions.waitingStrategy = waitingStrategy
+	return newOptions
+}
+
+func (o Options) WithPick(allowPick bool) Options {
+	newOptions := o
+	newOptions.allowPick = allowPick
+	return newOptions
+}
+
+func (o Options) ApplyConfigParameter(containerName string, labelSelector map[string]string, imageSelector []string, namespace string, pod string) Options {
+	newOptions := o
+	if containerName != "" && o.selector.ContainerName == "" {
+		newOptions.selector.ContainerName = containerName
 	}
-	if labelSelector != nil && o.LabelSelector == "" {
-		newOptions.LabelSelector = labels.Set(labelSelector).String()
+	if labelSelector != nil && o.selector.LabelSelector == "" {
+		newOptions.selector.LabelSelector = labels.Set(labelSelector).String()
 	}
-	if namespace != "" && o.Namespace == "" {
-		newOptions.Namespace = namespace
+	if namespace != "" && o.selector.Namespace == "" {
+		newOptions.selector.Namespace = namespace
 	}
-	if pod != "" && o.Pod == "" {
-		newOptions.Pod = pod
+	if pod != "" && o.selector.Pod == "" {
+		newOptions.selector.Pod = pod
+	}
+	if len(imageSelector) > 0 && len(o.selector.ImageSelector) == 0 {
+		newOptions.selector.ImageSelector = imageSelector
 	}
 	return newOptions
 }
 
-func (o Options) ApplyCmdParameter(containerName string, labelSelector string, namespace string, pod string) Options {
-	newOptions := o
-	if containerName != "" {
-		newOptions.ContainerName = containerName
+func ToStringImageSelector(imageSelector []imageselector.ImageSelector) []string {
+	imageSelectors := []string{}
+	for _, i := range imageSelector {
+		if i.Image == "" {
+			continue
+		}
+
+		imageSelectors = append(imageSelectors, i.Image)
 	}
-	if labelSelector != "" {
-		newOptions.LabelSelector = labelSelector
-	}
-	if namespace != "" {
-		newOptions.Namespace = namespace
-	}
-	if pod != "" {
-		newOptions.Pod = pod
-	}
-	return newOptions
+
+	return imageSelectors
 }
 
 type TargetSelector interface {
-	SelectSinglePod(ctx context.Context, options Options, log log.Logger) (*v1.Pod, error)
-	SelectSingleContainer(ctx context.Context, options Options, log log.Logger) (*selector.SelectedPodContainer, error)
+	SelectSinglePod(ctx context.Context, client kubectl.Client, log log.Logger) (*v1.Pod, error)
+	SelectSingleContainer(ctx context.Context, client kubectl.Client, log log.Logger) (*selector.SelectedPodContainer, error)
+
+	WithContainer(container string) TargetSelector
 }
 
 // targetSelector is the struct that will select a target
 type targetSelector struct {
-	client kubectl.Client
+	options Options
 }
 
 // NewTargetSelector creates a new target selector for selecting a target pod or container
-func NewTargetSelector(client kubectl.Client) TargetSelector {
+func NewTargetSelector(options Options) TargetSelector {
 	return &targetSelector{
-		client: client,
+		options: options,
 	}
 }
 
-func (t *targetSelector) SelectSingleContainer(ctx context.Context, options Options, log log.Logger) (*selector.SelectedPodContainer, error) {
-	container, err := t.selectSingle(ctx, options, log, t.selectSingleContainer)
+func (t *targetSelector) WithContainer(container string) TargetSelector {
+	return &targetSelector{
+		options: t.options.WithContainer(container),
+	}
+}
+
+func (t *targetSelector) SelectSingleContainer(ctx context.Context, client kubectl.Client, log log.Logger) (*selector.SelectedPodContainer, error) {
+	log.Debugf("Start selecting a single container with selector %v", t.options.selector.String())
+
+	if t.options.waitingStrategy != nil {
+		t.options.waitingStrategy = t.options.waitingStrategy.Reset()
+	}
+
+	container, err := t.selectSingle(ctx, client, t.options, log, t.selectSingleContainer)
 	if err != nil {
 		return nil, err
 	} else if container == nil {
@@ -131,8 +209,14 @@ func (t *targetSelector) SelectSingleContainer(ctx context.Context, options Opti
 	return container.(*selector.SelectedPodContainer), nil
 }
 
-func (t *targetSelector) SelectSinglePod(ctx context.Context, options Options, log log.Logger) (*v1.Pod, error) {
-	pod, err := t.selectSingle(ctx, options, log, t.selectSinglePod)
+func (t *targetSelector) SelectSinglePod(ctx context.Context, client kubectl.Client, log log.Logger) (*v1.Pod, error) {
+	log.Debugf("Start selecting a single pod with selector %v", t.options.selector.String())
+
+	if t.options.waitingStrategy != nil {
+		t.options.waitingStrategy = t.options.waitingStrategy.Reset()
+	}
+
+	pod, err := t.selectSingle(ctx, client, t.options, log, t.selectSinglePod)
 	if err != nil {
 		return nil, err
 	} else if pod == nil {
@@ -142,16 +226,16 @@ func (t *targetSelector) SelectSinglePod(ctx context.Context, options Options, l
 	return pod.(*v1.Pod), nil
 }
 
-func (t *targetSelector) selectSingle(ctx context.Context, options Options, log log.Logger, selectFn func(ctx context.Context, options Options, log log.Logger) (bool, interface{}, error)) (interface{}, error) {
-	if options.Wait == nil || *options.Wait == true {
+func (t *targetSelector) selectSingle(ctx context.Context, client kubectl.Client, options Options, log log.Logger, selectFn func(ctx context.Context, client kubectl.Client, options Options, log log.Logger) (bool, interface{}, error)) (interface{}, error) {
+	if options.wait == nil || *options.wait {
 		timeout := time.Minute * 10
-		if options.Timeout > 0 {
-			timeout = time.Duration(options.Timeout) * time.Second
+		if options.timeout > 0 {
+			timeout = time.Duration(options.timeout) * time.Second
 		}
 
 		var out interface{}
-		err := wait.PollImmediate(time.Second, timeout, func() (done bool, err error) {
-			done, o, err := selectFn(ctx, options, log)
+		err := wait.PollImmediateWithContext(ctx, time.Millisecond*500, timeout, func(ctx context.Context) (done bool, err error) {
+			done, o, err := selectFn(ctx, client, options, log)
 			if err != nil {
 				return false, err
 			} else if !done {
@@ -165,7 +249,7 @@ func (t *targetSelector) selectSingle(ctx context.Context, options Options, log 
 			if err == wait.ErrWaitTimeout {
 				return nil, &NotFoundErr{
 					Timeout:  true,
-					Selector: options.Selector.String(),
+					Selector: options.selector.String(),
 				}
 			}
 
@@ -176,12 +260,12 @@ func (t *targetSelector) selectSingle(ctx context.Context, options Options, log 
 	}
 
 	// we try to select a pod
-	done, out, err := selectFn(ctx, options, log)
+	done, out, err := selectFn(ctx, client, options, log)
 	if err != nil {
 		return nil, err
 	} else if !done {
 		return nil, &NotFoundErr{
-			Selector: options.Selector.String(),
+			Selector: options.selector.String(),
 		}
 	}
 
@@ -189,12 +273,12 @@ func (t *targetSelector) selectSingle(ctx context.Context, options Options, log 
 	return out, nil
 }
 
-func (t *targetSelector) selectSingleContainer(ctx context.Context, options Options, log log.Logger) (bool, interface{}, error) {
-	containers, err := selector.NewFilterWithSort(t.client, options.SortPods, options.SortContainers).SelectContainers(ctx, options.Selector)
+func (t *targetSelector) selectSingleContainer(ctx context.Context, client kubectl.Client, options Options, log log.Logger) (bool, interface{}, error) {
+	containers, err := selector.NewFilterWithSort(client, options.sortContainers).SelectContainers(ctx, options.selector)
 	if err != nil {
 		return false, nil, err
-	} else if options.WaitingStrategy != nil {
-		return options.WaitingStrategy.SelectContainer(containers, log)
+	} else if options.waitingStrategy != nil {
+		return options.waitingStrategy.SelectContainer(ctx, client, options.selector.Namespace, containers, log)
 	}
 
 	if len(containers) == 0 {
@@ -203,15 +287,15 @@ func (t *targetSelector) selectSingleContainer(ctx context.Context, options Opti
 		return true, containers[0], nil
 	}
 
-	if options.AllowPick {
+	if options.allowPick {
 		names := []string{}
 		for _, container := range containers {
 			names = append(names, container.Pod.Name+":"+container.Container.Name)
 		}
 
 		question := DefaultContainerQuestion
-		if options.Question != "" {
-			question = options.Question
+		if options.question != "" {
+			question = options.question
 		}
 
 		containerName, err := log.Question(&survey.QuestionOptions{
@@ -232,19 +316,28 @@ func (t *targetSelector) selectSingleContainer(ctx context.Context, options Opti
 	}
 
 	// there are two options now, either take the first pod found or error out
-	if options.FailIfMultiple {
-		return false, nil, fmt.Errorf("found multiple containers for %s", options.Selector.String())
+	if options.failIfMultiple {
+		return false, nil, fmt.Errorf("found multiple containers for %s", options.selector.String())
 	}
 
 	return true, containers[0], nil
 }
 
-func (t *targetSelector) selectSinglePod(ctx context.Context, options Options, log log.Logger) (bool, interface{}, error) {
-	pods, err := selector.NewFilterWithSort(t.client, options.SortPods, options.SortContainers).SelectPods(ctx, options.Selector)
+func (t *targetSelector) selectSinglePod(ctx context.Context, client kubectl.Client, options Options, log log.Logger) (bool, interface{}, error) {
+	stack, err := selector.NewFilterWithSort(client, options.sortContainers).SelectContainers(ctx, options.selector)
 	if err != nil {
 		return false, nil, err
-	} else if options.WaitingStrategy != nil {
-		return options.WaitingStrategy.SelectPod(pods, log)
+	}
+
+	// transform stack
+	pods := selector.PodsFromPodContainer(stack)
+	if options.waitingStrategy != nil {
+		namespace := options.selector.Namespace
+		if namespace == "" {
+			namespace = client.Namespace()
+		}
+
+		return options.waitingStrategy.SelectPod(ctx, client, namespace, pods, log)
 	}
 
 	if len(pods) == 0 {
@@ -253,15 +346,15 @@ func (t *targetSelector) selectSinglePod(ctx context.Context, options Options, l
 		return true, pods[0], nil
 	}
 
-	if options.AllowPick {
+	if options.allowPick {
 		podNames := []string{}
 		for _, pod := range pods {
 			podNames = append(podNames, pod.Name)
 		}
 
 		question := DefaultPodQuestion
-		if options.Question != "" {
-			question = options.Question
+		if options.question != "" {
+			question = options.question
 		}
 
 		podName, err := log.Question(&survey.QuestionOptions{
@@ -282,8 +375,8 @@ func (t *targetSelector) selectSinglePod(ctx context.Context, options Options, l
 	}
 
 	// there are two options now, either take the first pod found or error out
-	if options.FailIfMultiple {
-		return false, nil, fmt.Errorf("found multiple pods for %s", options.Selector.String())
+	if options.failIfMultiple {
+		return false, nil, fmt.Errorf("found multiple pods for %s", options.selector.String())
 	}
 
 	return true, pods[0], nil

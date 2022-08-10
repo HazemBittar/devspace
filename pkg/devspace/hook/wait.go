@@ -2,21 +2,21 @@ package hook
 
 import (
 	"context"
-	"github.com/loft-sh/devspace/pkg/devspace/config"
+	"github.com/loft-sh/devspace/pkg/devspace/config/loader/variable/runtime"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
+	"github.com/loft-sh/devspace/pkg/devspace/imageselector"
+	"sync"
+	"time"
+
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
-	"github.com/loft-sh/devspace/pkg/devspace/dependency/types"
-	"github.com/loft-sh/devspace/pkg/devspace/deploy/deployer/util"
 	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
 	"github.com/loft-sh/devspace/pkg/devspace/kubectl/selector"
 	"github.com/loft-sh/devspace/pkg/devspace/services/targetselector"
-	"github.com/loft-sh/devspace/pkg/util/imageselector"
 	logpkg "github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/mgutz/ansi"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"sync"
-	"time"
 )
 
 func NewWaitHook() Hook {
@@ -27,8 +27,8 @@ type waitHook struct {
 	printWarning sync.Once
 }
 
-func (r *waitHook) Execute(ctx Context, hook *latest.HookConfig, config config.Config, dependencies []types.Dependency, log logpkg.Logger) error {
-	if ctx.Client == nil {
+func (r *waitHook) Execute(ctx devspacecontext.Context, hook *latest.HookConfig, extraEnv map[string]string) error {
+	if ctx.KubeClient() == nil {
 		return errors.Errorf("Cannot execute hook '%s': kube client is not initialized", ansi.Color(hookName(hook), "white+b"))
 	}
 
@@ -36,23 +36,13 @@ func (r *waitHook) Execute(ctx Context, hook *latest.HookConfig, config config.C
 		imageSelectors []imageselector.ImageSelector
 		err            error
 	)
-	if hook.Where.Container.ImageName != "" || hook.Where.Container.ImageSelector != "" {
-		if config == nil || config.Generated() == nil {
+	if hook.Container.ImageSelector != "" {
+		if ctx.Config() == nil || ctx.Config().LocalCache() == nil {
 			return errors.Errorf("Cannot execute hook '%s': config is not loaded", ansi.Color(hookName(hook), "white+b"))
 		}
 
-		if hook.Where.Container.ImageName != "" {
-			imageSelectorFromConfig, err := imageselector.Resolve(hook.Where.Container.ImageName, config, dependencies)
-			if err != nil {
-				return err
-			}
-			if imageSelectorFromConfig != nil {
-				imageSelectors = append(imageSelectors, *imageSelectorFromConfig)
-			}
-		}
-
-		if hook.Where.Container.ImageSelector != "" {
-			imageSelector, err := util.ResolveImageAsImageSelector(hook.Where.Container.ImageSelector, config, dependencies)
+		if hook.Container.ImageSelector != "" {
+			imageSelector, err := runtime.NewRuntimeResolver(ctx.WorkingDir(), true).FillRuntimeVariablesAsImageSelector(ctx.Context(), hook.Container.ImageSelector, ctx.Config(), ctx.Dependencies())
 			if err != nil {
 				return err
 			}
@@ -61,19 +51,19 @@ func (r *waitHook) Execute(ctx Context, hook *latest.HookConfig, config config.C
 		}
 	}
 
-	err = r.execute(ctx, hook, imageSelectors, log)
+	err = r.execute(ctx.Context(), hook, ctx.KubeClient(), imageSelectors, ctx.Log())
 	if err != nil {
 		return err
 	}
 
-	log.Donef("Hook '%s' successfully executed", ansi.Color(hookName(hook), "white+b"))
+	ctx.Log().Donef("Hook '%s' successfully executed", ansi.Color(hookName(hook), "white+b"))
 	return nil
 }
 
-func (r *waitHook) execute(ctx Context, hook *latest.HookConfig, imageSelector []imageselector.ImageSelector, log logpkg.Logger) error {
+func (r *waitHook) execute(ctx context.Context, hook *latest.HookConfig, client kubectl.Client, imageSelector []imageselector.ImageSelector, log logpkg.Logger) error {
 	labelSelector := ""
-	if len(hook.Where.Container.LabelSelector) > 0 {
-		labelSelector = labels.Set(hook.Where.Container.LabelSelector).String()
+	if len(hook.Container.LabelSelector) > 0 {
+		labelSelector = labels.Set(hook.Container.LabelSelector).String()
 	}
 
 	timeout := int64(150)
@@ -83,12 +73,13 @@ func (r *waitHook) execute(ctx Context, hook *latest.HookConfig, imageSelector [
 
 	// wait until the defined condition will be true, this will wait initially 2 seconds
 	err := wait.Poll(time.Second*2, time.Duration(timeout)*time.Second, func() (done bool, err error) {
-		podContainers, err := selector.NewFilter(ctx.Client).SelectContainers(context.TODO(), selector.Selector{
-			ImageSelector: imageSelector,
-			LabelSelector: labelSelector,
-			Pod:           hook.Where.Container.Pod,
-			ContainerName: hook.Where.Container.ContainerName,
-			Namespace:     hook.Where.Container.Namespace,
+		podContainers, err := selector.NewFilter(client).SelectContainers(ctx, selector.Selector{
+			ImageSelector:   targetselector.ToStringImageSelector(imageSelector),
+			LabelSelector:   labelSelector,
+			Pod:             hook.Container.Pod,
+			ContainerName:   hook.Container.ContainerName,
+			Namespace:       hook.Container.Namespace,
+			FilterContainer: selector.FilterTerminatingContainers,
 		})
 		if err != nil {
 			return false, err
@@ -103,7 +94,7 @@ func (r *waitHook) execute(ctx Context, hook *latest.HookConfig, imageSelector [
 				})
 			}
 
-			if isWaitConditionTrue(hook.Wait, pc) == false {
+			if !isWaitConditionTrue(hook.Wait, pc) {
 				return false, nil
 			}
 		}
@@ -118,7 +109,7 @@ func (r *waitHook) execute(ctx Context, hook *latest.HookConfig, imageSelector [
 }
 
 func isWaitConditionTrue(condition *latest.HookWaitConfig, podContainer *selector.SelectedPodContainer) bool {
-	if podContainer.Pod.DeletionTimestamp != nil {
+	if selector.IsPodTerminating(podContainer.Pod) {
 		return false
 	}
 

@@ -1,31 +1,40 @@
 package loader
 
 import (
+	"context"
 	"fmt"
+	"github.com/loft-sh/devspace/pkg/devspace/context/values"
+	"github.com/loft-sh/devspace/pkg/util/encoding"
+	"github.com/loft-sh/devspace/pkg/util/yamlutil"
 	"io/ioutil"
+	"mvdan.cc/sh/v3/expand"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/loft-sh/devspace/pkg/devspace/config/localcache"
+	"github.com/loft-sh/devspace/pkg/devspace/config/remotecache"
+	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
+	"github.com/loft-sh/devspace/pkg/util/command"
+
+	"github.com/loft-sh/devspace/pkg/util/constraint"
 
 	"github.com/loft-sh/devspace/pkg/devspace/plugin"
 	"github.com/loft-sh/devspace/pkg/devspace/upgrade"
 
 	"github.com/loft-sh/devspace/pkg/devspace/config/loader/variable"
+	"github.com/loft-sh/devspace/pkg/devspace/config/loader/variable/expression"
 	"github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 
 	"github.com/loft-sh/devspace/pkg/devspace/config"
 	"github.com/loft-sh/devspace/pkg/devspace/config/constants"
-	"github.com/loft-sh/devspace/pkg/devspace/config/generated"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
-	"github.com/loft-sh/devspace/pkg/util/kubeconfig"
 	"github.com/loft-sh/devspace/pkg/util/log"
-
-	version "github.com/hashicorp/go-version"
+	"github.com/loft-sh/devspace/pkg/util/vars"
 )
 
 // DefaultCommandVersionRegEx is the default regex to use if no regex is specified for determining the commands version
@@ -35,25 +44,26 @@ var DefaultCommandVersionRegEx = "(v\\d+\\.\\d+\\.\\d+)"
 type ConfigLoader interface {
 	// Load loads the devspace.yaml, parses it, applies profiles, fills in variables and
 	// finally returns it.
-	Load(options *ConfigOptions, log log.Logger) (config.Config, error)
+	Load(ctx context.Context, client kubectl.Client, options *ConfigOptions, log log.Logger) (config.Config, error)
 
-	// LoadRaw loads the config without parsing it.
-	LoadRaw() (map[interface{}]interface{}, error)
+	// LoadWithCache loads the devspace.yaml, parses it, applies profiles, fills in variables and
+	// finally returns it.
+	LoadWithCache(ctx context.Context, localCache localcache.Cache, client kubectl.Client, options *ConfigOptions, log log.Logger) (config.Config, error)
 
 	// LoadWithParser loads the config with the given parser
-	LoadWithParser(parser Parser, options *ConfigOptions, log log.Logger) (config.Config, error)
+	LoadWithParser(ctx context.Context, localCache localcache.Cache, client kubectl.Client, parser Parser, options *ConfigOptions, log log.Logger) (config.Config, error)
 
-	// LoadGenerated loads the generated config
-	LoadGenerated(options *ConfigOptions) (*generated.Config, error)
+	// LoadRaw loads the config without parsing it.
+	LoadRaw() (map[string]interface{}, error)
 
-	// Save saves a devspace.yaml to file
-	Save(config *latest.Config) error
-
-	// SaveGenerated saves a generated config yaml to file
-	SaveGenerated(generated *generated.Config) error
+	// LoadLocalCache loads the local cache from this config loader
+	LoadLocalCache() (localcache.Cache, error)
 
 	// Exists returns if a devspace.yaml could be found
 	Exists() bool
+
+	// ConfigPath returns the absolute devspace.yaml path for this config loader
+	ConfigPath() string
 
 	// SetDevSpaceRoot searches for a devspace.yaml in the current directory and parent directories
 	// and will return if a devspace.yaml was found as well as switch to the current
@@ -62,100 +72,123 @@ type ConfigLoader interface {
 }
 
 type configLoader struct {
-	kubeConfigLoader kubeconfig.Loader
-
-	configPath string
+	absConfigPath string
 }
 
 // NewConfigLoader creates a new config loader with the given options
-func NewConfigLoader(configPath string) ConfigLoader {
-	return &configLoader{
-		configPath:       configPath,
-		kubeConfigLoader: kubeconfig.NewLoader(),
+func NewConfigLoader(configPath string) (ConfigLoader, error) {
+	if configPath == "" {
+		configPath = os.Getenv("DEVSPACE_CONFIG")
 	}
+
+	absPath, err := filepath.Abs(ConfigPath(configPath))
+	if err != nil {
+		return nil, err
+	}
+
+	return &configLoader{
+		absConfigPath: absPath,
+	}, nil
 }
 
-// LoadGenerated loads the generated config from file
-func (l *configLoader) LoadGenerated(options *ConfigOptions) (*generated.Config, error) {
-	var err error
-	if options == nil {
-		options = &ConfigOptions{}
-	}
+func (l *configLoader) ConfigPath() string {
+	return l.absConfigPath
+}
 
-	generatedConfig := options.GeneratedConfig
-	if generatedConfig == nil {
-		if options.generatedLoader == nil {
-			generatedConfig, err = generated.NewConfigLoaderFromDevSpacePath(GetLastProfile(options.Profiles), l.configPath).Load()
-		} else {
-			generatedConfig, err = options.generatedLoader.Load()
-		}
+func (l *configLoader) LoadLocalCache() (localcache.Cache, error) {
+	return localcache.NewCacheLoader().Load(l.absConfigPath)
+}
+
+// Load restores variables from the cluster (if wanted), loads the config and then saves them to the cluster again
+func (l *configLoader) Load(ctx context.Context, client kubectl.Client, options *ConfigOptions, log log.Logger) (config.Config, error) {
+	return l.LoadWithCache(ctx, nil, client, options, log)
+}
+
+// LoadWithCache loads the config with the given local cache
+func (l *configLoader) LoadWithCache(ctx context.Context, localCache localcache.Cache, client kubectl.Client, options *ConfigOptions, log log.Logger) (config.Config, error) {
+	return l.LoadWithParser(ctx, localCache, client, NewDefaultParser(), options, log)
+}
+
+// LoadWithParser loads the config with the given parser
+func (l *configLoader) LoadWithParser(ctx context.Context, localCache localcache.Cache, client kubectl.Client, parser Parser, options *ConfigOptions, log log.Logger) (_ config.Config, err error) {
+	if localCache == nil {
+		localCache, err = l.LoadLocalCache()
 		if err != nil {
 			return nil, err
 		}
 	}
-
-	return generatedConfig, nil
-}
-
-// Load restores variables from the cluster (if wanted), loads the config and then saves them to the cluster again
-func (l *configLoader) Load(options *ConfigOptions, log log.Logger) (config.Config, error) {
-	return l.LoadWithParser(NewDefaultParser(), options, log)
-}
-
-// LoadWithParser loads the config with the given parser
-func (l *configLoader) LoadWithParser(parser Parser, options *ConfigOptions, log log.Logger) (config.Config, error) {
 	if options == nil {
 		options = &ConfigOptions{}
 	}
 
-	absPath, err := filepath.Abs(ConfigPath(l.configPath))
-	if err != nil {
-		return nil, err
-	}
+	defer func() {
+		if err != nil {
+			pluginErr := plugin.ExecutePluginHookWithContext(map[string]interface{}{"ERROR": err, "LOAD_PATH": l.absConfigPath}, "config.errorLoad", "error:loadConfig")
+			if pluginErr != nil {
+				log.Warnf("Error executing plugin hook: %v", pluginErr)
+				return
+			}
+		}
+	}()
 
 	// call plugin hook
-	pluginErr := plugin.ExecutePluginHookWithContext("config.beforeLoad", map[string]interface{}{"LOAD_PATH": absPath})
+	pluginErr := plugin.ExecutePluginHookWithContext(map[string]interface{}{"LOAD_PATH": l.absConfigPath}, "config.beforeLoad", "before:loadConfig")
 	if pluginErr != nil {
 		return nil, pluginErr
 	}
 
+	// load the raw data
 	data, err := l.LoadRaw()
 	if err != nil {
-		pluginErr = plugin.ExecutePluginHookWithContext("config.errorLoad", map[string]interface{}{"ERROR": err, "LOAD_PATH": absPath})
-		if pluginErr != nil {
-			return nil, pluginErr
-		}
-
 		return nil, err
 	}
 
-	parsedConfig, generatedConfig, resolver, err := l.parseConfig(absPath, data, parser, options, log)
-	if err != nil {
-		pluginErr = plugin.ExecutePluginHookWithContext("config.errorLoad", map[string]interface{}{"ERROR": err, "LOAD_PATH": absPath})
-		if pluginErr != nil {
-			return nil, pluginErr
+	// make sure name is in config
+	name := options.OverrideName
+	if name == "" {
+		var ok bool
+		name, ok = data["name"].(string)
+		if !ok {
+			return nil, fmt.Errorf("name is missing in " + filepath.Base(l.absConfigPath))
 		}
+	} else {
+		data["name"] = options.OverrideName
+	}
 
+	// validate name
+	if encoding.IsUnsafeName(name) {
+		return nil, fmt.Errorf("DevSpace config has an invalid name '%s', must match regex %s", name, encoding.UnsafeNameRegEx.String())
+	}
+
+	// set name to context
+	ctx = values.WithName(ctx, name)
+
+	// create remote cache
+	var remoteCache remotecache.Cache
+	if client != nil {
+		remoteCache, err = remotecache.NewCacheLoader(name).Load(ctx, client)
+		if err != nil {
+			return nil, fmt.Errorf("error trying to load remote cache from current context and namespace: %v", err)
+		}
+	}
+
+	parsedConfig, rawBeforeConversion, resolver, err := l.parseConfig(ctx, data, localCache, remoteCache, client, parser, options, log)
+	if err != nil {
 		return nil, err
 	}
 
-	err = l.ensureRequires(parsedConfig, log)
+	err = l.ensureRequires(ctx, parsedConfig, log)
 	if err != nil {
-		pluginErr = plugin.ExecutePluginHookWithContext("config.errorLoad", map[string]interface{}{"ERROR": err, "LOAD_PATH": absPath})
-		if pluginErr != nil {
-			return nil, pluginErr
-		}
-
 		return nil, errors.Wrap(err, "require versions")
 	}
 
-	c := config.NewConfig(data, parsedConfig, generatedConfig, resolver.ResolvedVariables(), absPath)
-	pluginErr = plugin.ExecutePluginHookWithContext("config.afterLoad", map[string]interface{}{
-		"LOAD_PATH":     absPath,
+	c := config.NewConfig(data, rawBeforeConversion, parsedConfig, localCache, remoteCache, resolver.ResolvedVariables(), l.absConfigPath)
+	pluginErr = plugin.ExecutePluginHookWithContext(map[string]interface{}{
+		"LOAD_PATH":     l.absConfigPath,
 		"LOADED_CONFIG": c.Config(),
 		"LOADED_VARS":   c.Variables(),
 		"LOADED_RAW":    c.Raw(),
-	})
+	}, "config.afterLoad", "after:loadConfig")
 	if pluginErr != nil {
 		return nil, pluginErr
 	}
@@ -163,23 +196,23 @@ func (l *configLoader) LoadWithParser(parser Parser, options *ConfigOptions, log
 	return c, nil
 }
 
-func (l *configLoader) ensureRequires(config *latest.Config, log log.Logger) error {
+func (l *configLoader) ensureRequires(ctx context.Context, config *latest.Config, log log.Logger) error {
 	if config == nil {
 		return nil
 	}
 
 	if config.Require.DevSpace != "" {
-		constraint, err := version.NewConstraint(config.Require.DevSpace)
+		parsedConstraint, err := constraint.NewConstraint(config.Require.DevSpace)
 		if err != nil {
 			return errors.Wrap(err, "parsing require.devspace")
 		}
 
-		v, err := version.NewSemver(upgrade.GetVersion())
+		v, err := constraint.NewSemver(upgrade.GetVersion())
 		if err != nil {
 			return errors.Wrap(err, "parsing devspace version")
 		}
 
-		if constraint.Check(v) == false {
+		if !parsedConstraint.Check(v) {
 			return fmt.Errorf("DevSpace version mismatch: %s (currently installed) does not match %s (required by config). Please make sure you have installed DevSpace with version %s", upgrade.GetVersion(), config.Require.DevSpace, config.Require.DevSpace)
 		}
 	}
@@ -194,17 +227,17 @@ func (l *configLoader) ensureRequires(config *latest.Config, log log.Logger) err
 				return fmt.Errorf("cannot find plugin '%s', however it is required by the config. Please make sure you have installed the plugin '%s' with version %s", p.Name, p.Name, p.Version)
 			}
 
-			constraint, err := version.NewConstraint(p.Version)
+			parsedConstraint, err := constraint.NewConstraint(p.Version)
 			if err != nil {
 				return errors.Wrapf(err, "parsing require.plugins[%d].version", index)
 			}
 
-			v, err := version.NewSemver(metadata.Version)
+			v, err := constraint.NewSemver(metadata.Version)
 			if err != nil {
 				return errors.Wrapf(err, "parsing plugin %s version", p.Name)
 			}
 
-			if constraint.Check(v) == false {
+			if !parsedConstraint.Check(v) {
 				return fmt.Errorf("plugin '%s' version mismatch: %s (currently installed) does not match %s (required by config). Please make sure you have installed the plugin '%s' with version %s", p.Name, metadata.Version, p.Version, p.Name, p.Version)
 			}
 		}
@@ -226,12 +259,12 @@ func (l *configLoader) ensureRequires(config *latest.Config, log log.Logger) err
 			return errors.Wrapf(err, "parsing require.commands[%d].versionRegEx", index)
 		}
 
-		constraint, err := version.NewConstraint(c.Version)
+		parsedConstraint, err := constraint.NewConstraint(c.Version)
 		if err != nil {
 			return errors.Wrapf(err, "parsing require.commands[%d].version", index)
 		}
 
-		out, err := exec.Command(c.Name, versionArgs...).Output()
+		out, err := command.Output(ctx, filepath.Dir(l.absConfigPath), expand.ListEnviron(os.Environ()...), c.Name, versionArgs...)
 		if err != nil {
 			return fmt.Errorf("cannot run command '%s' (%v), however it is required by the config. Please make sure you have correctly installed '%s' with version %s", c.Name, err, c.Name, c.Version)
 		}
@@ -241,12 +274,12 @@ func (l *configLoader) ensureRequires(config *latest.Config, log log.Logger) err
 			return fmt.Errorf("command %s %s output does not match the provided regex '%s', however the command is required by the config. Please make sure you have correctly installed '%s' with version %s", c.Name, strings.Join(versionArgs, " "), regExString, c.Name, c.Version)
 		}
 
-		v, err := version.NewSemver(matches[1])
+		v, err := constraint.NewSemver(matches[1])
 		if err != nil {
 			return fmt.Errorf("command %s %s output does not return a semver version, however the command is required by the config. Please make sure you have correctly installed '%s' with version %s", c.Name, strings.Join(versionArgs, " "), c.Name, c.Version)
 		}
 
-		if constraint.Check(v) == false {
+		if !parsedConstraint.Check(v) {
 			return fmt.Errorf("command '%s' version mismatch: %s (currently installed) does not match %s (required by config). Please make sure you have correctly installed '%s' with version %s", c.Name, matches[1], c.Version, c.Name, c.Version)
 		}
 	}
@@ -254,51 +287,49 @@ func (l *configLoader) ensureRequires(config *latest.Config, log log.Logger) err
 	return nil
 }
 
-func (l *configLoader) parseConfig(absPath string, rawConfig map[interface{}]interface{}, parser Parser, options *ConfigOptions, log log.Logger) (*latest.Config, *generated.Config, variable.Resolver, error) {
-	// load the generated config
-	generatedConfig, err := l.LoadGenerated(options)
+func (l *configLoader) parseConfig(
+	ctx context.Context,
+	rawConfig map[string]interface{},
+	localCache localcache.Cache,
+	remoteCache remotecache.Cache,
+	client kubectl.Client,
+	parser Parser,
+	options *ConfigOptions,
+	log log.Logger,
+) (*latest.Config, map[string]interface{}, variable.Resolver, error) {
+	// create a new variable resolver
+	resolver, err := variable.NewResolver(localCache, &variable.PredefinedVariableOptions{
+		ConfigPath: l.absConfigPath,
+		KubeClient: client,
+		Profile:    GetLastProfile(options.Profiles),
+	}, options.Vars, log)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	// restore vars if wanted
-	if options.KubeClient != nil && options.RestoreVars {
-		vars, _, err := RestoreVarsFromSecret(options.KubeClient, options.VarsSecretName)
-		if err != nil {
-			return nil, nil, nil, errors.Wrap(err, "restore vars")
-		} else if vars != nil {
-			generatedConfig.Vars = vars
-		}
-	}
-
-	// check if we should load the profile from the generated config
-	if generatedConfig.ActiveProfile != "" && len(options.Profiles) == 0 {
-		options.Profiles = []string{generatedConfig.ActiveProfile}
-	}
-
-	// create a new variable resolver
-	resolver := l.newVariableResolver(generatedConfig, options, log)
-
 	// copy raw config
-	copiedRawConfig, err := copyRaw(rawConfig)
+	copiedRawConfig, err := ResolveImports(ctx, resolver, filepath.Dir(l.absConfigPath), rawConfig, log)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Delete imports from config
+	delete(copiedRawConfig, "imports")
+
+	// prepare profiles
+	copiedRawConfig, err = prepareProfiles(ctx, copiedRawConfig, resolver)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
 	// apply the profiles
-	copiedRawConfig, err = l.applyProfiles(copiedRawConfig, options, log)
+	copiedRawConfig, err = l.applyProfiles(ctx, copiedRawConfig, options, resolver, log)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	// Load defined variables
-	vars, err := versions.ParseVariables(copiedRawConfig, log)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	// validate variables
-	err = validateVars(vars)
+	// reload variables to make sure they are loaded correctly
+	err = reloadVariables(resolver, copiedRawConfig, log)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -307,41 +338,204 @@ func (l *configLoader) parseConfig(absPath string, rawConfig map[interface{}]int
 	delete(copiedRawConfig, "vars")
 
 	// parse the config
-	latestConfig, err := parser.Parse(absPath, rawConfig, copiedRawConfig, vars, resolver, options, log)
+	latestConfig, rawBeforeConversion, err := parser.Parse(ctx, rawConfig, copiedRawConfig, resolver, log)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	// now we validate the config
-	err = validate(latestConfig, log)
+	// check if we do not want to change the generated config or
+	// secret vars.
+	if options.Dry {
+		return latestConfig, rawBeforeConversion, resolver, nil
+	}
+
+	// save local cache
+	err = localCache.Save()
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	// Save generated config
-	if options.generatedLoader == nil {
-		err = generated.NewConfigLoaderFromDevSpacePath(GetLastProfile(options.Profiles), l.configPath).Save(generatedConfig)
-	} else {
-		err = options.generatedLoader.Save(generatedConfig)
-	}
+	return latestConfig, rawBeforeConversion, resolver, nil
+}
+
+func reloadVariables(resolver variable.Resolver, rawConfig map[string]interface{}, log log.Logger) error {
+	// Load defined variables again (might be changed through profiles)
+	loadedVars, err := versions.ParseVariables(rawConfig, log)
 	if err != nil {
-		return nil, nil, nil, err
+		return err
 	}
 
-	// save vars if wanted
-	if options.KubeClient != nil && options.SaveVars {
-		err = SaveVarsInSecret(options.KubeClient, generatedConfig.Vars, options.VarsSecretName, log)
-		if err != nil {
-			return nil, nil, nil, errors.Wrap(err, "save vars")
+	// update the used vars in the resolver
+	resolver.UpdateVars(loadedVars)
+	return nil
+}
+
+func validateProfile(profile interface{}) error {
+	profileMap, ok := profile.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("profile is not an object")
+	}
+
+	parents := profileMap["parents"]
+	if parents != nil {
+		parentsString, ok := parents.(string)
+		if ok {
+			if vars.VarMatchRegex.MatchString(parentsString) {
+				return fmt.Errorf("parents cannot be a variable")
+			}
+
+			if expression.ExpressionMatchRegex.MatchString(parentsString) {
+				return fmt.Errorf("parents cannot be an expression")
+			}
+
+			return fmt.Errorf("parents is not an array")
 		}
 	}
 
-	return latestConfig, generatedConfig, resolver, nil
+	activation := profileMap["activation"]
+	if activation != nil {
+		activationString, ok := activation.(string)
+		if ok {
+			if vars.VarMatchRegex.MatchString(activationString) {
+				return fmt.Errorf("activation cannot be a variable")
+			}
+
+			if expression.ExpressionMatchRegex.MatchString(activationString) {
+				return fmt.Errorf("activation cannot be an expression")
+			}
+
+			return fmt.Errorf("activation is not an array")
+		}
+	}
+
+	profileConfig, err := copyForValidation(profile)
+	if err != nil {
+		return err
+	}
+
+	if vars.VarMatchRegex.MatchString(profileConfig.Name) {
+		return fmt.Errorf("name cannot be a variable")
+	}
+
+	if expression.ExpressionMatchRegex.MatchString(profileConfig.Name) {
+		return fmt.Errorf("name cannot be an expression")
+	}
+
+	if vars.VarMatchRegex.MatchString(profileConfig.Parent) {
+		return fmt.Errorf("parent cannot be a variable")
+	}
+
+	if expression.ExpressionMatchRegex.MatchString(profileConfig.Parent) {
+		return fmt.Errorf("parent cannot be an expression")
+	}
+
+	for idx, patch := range profileConfig.Patches {
+		if expression.ExpressionMatchRegex.MatchString(patch.Path) {
+			return fmt.Errorf("patches[%d] path cannot be an expression", idx)
+		}
+
+		if vars.VarMatchRegex.MatchString(patch.Operation) {
+			return fmt.Errorf("patches[%d] op cannot be a variable", idx)
+		}
+
+		if expression.ExpressionMatchRegex.MatchString(patch.Operation) {
+			return fmt.Errorf("patches[%d] op cannot be an expression", idx)
+		}
+	}
+
+	return nil
 }
 
-func (l *configLoader) applyProfiles(data map[interface{}]interface{}, options *ConfigOptions, log log.Logger) (map[interface{}]interface{}, error) {
+func prepareProfiles(ctx context.Context, config map[string]interface{}, resolver variable.Resolver) (map[string]interface{}, error) {
+	rawProfiles := config["profiles"]
+	if rawProfiles == nil {
+		return config, nil
+	}
+
+	resolved, err := resolve(ctx, rawProfiles, resolver)
+	if err != nil {
+		return nil, err
+	}
+
+	profiles, ok := resolved.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("error validating profiles: not an array")
+	}
+
+	for idx, profile := range profiles {
+		resolvedProfile, err := resolve(ctx, profile, resolver)
+		if err != nil {
+			return nil, err
+		}
+
+		profileMap, ok := resolvedProfile.(map[string]interface{})
+		if !ok {
+			return nil, errors.Wrapf(err, "error resolving profiles[%d], object expected", idx)
+		}
+
+		// Resolve merge field
+		if profileMap["merge"] != nil {
+			merge, err := resolve(ctx, profileMap["merge"], resolver)
+			if err != nil {
+				return nil, err
+			}
+			profileMap["merge"] = merge
+		}
+
+		// Resolve patches field
+		if profileMap["patches"] != nil {
+			patches, err := resolve(ctx, profileMap["patches"], resolver)
+			if err != nil {
+				return nil, err
+			}
+			profileMap["patches"] = patches
+		}
+
+		// Resolve replace field
+		if profileMap["replace"] != nil {
+			replace, err := resolve(ctx, profileMap["replace"], resolver)
+			if err != nil {
+				return nil, err
+			}
+			profileMap["replace"] = replace
+		}
+
+		// Resolve strategicMerge field
+		if profileMap["strategicMerge"] != nil {
+			strategicMerge, err := resolve(ctx, profileMap["strategicMerge"], resolver)
+			if err != nil {
+				return nil, err
+			}
+			profileMap["strategicMerge"] = strategicMerge
+		}
+
+		// Validate that the profile doesn't use forbidden expressions
+		err = validateProfile(profileMap)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error validating profiles[%d]", idx)
+		}
+
+		profiles[idx] = profileMap
+	}
+
+	config["profiles"] = profiles
+
+	return config, nil
+}
+
+func resolve(ctx context.Context, data interface{}, resolver variable.Resolver) (interface{}, error) {
+	_, ok := data.(string)
+	if !ok {
+		return data, nil
+	}
+
+	// find and fill variables
+	return resolver.FillVariables(ctx, data)
+}
+
+func (l *configLoader) applyProfiles(ctx context.Context, data map[string]interface{}, options *ConfigOptions, resolver variable.Resolver, log log.Logger) (map[string]interface{}, error) {
 	// Get profile
-	profiles, err := versions.ParseProfile(filepath.Dir(l.configPath), data, options.Profiles, options.ProfileRefresh, options.DisableProfileActivation, log)
+	profiles, err := versions.ParseProfile(ctx, filepath.Dir(l.absConfigPath), data, options.Profiles, options.ProfileRefresh, options.DisableProfileActivation, resolver, log)
 	if err != nil {
 		return nil, err
 	}
@@ -363,12 +557,6 @@ func (l *configLoader) applyProfiles(data map[interface{}]interface{}, options *
 			return nil, err
 		}
 
-		// Apply strategic merge
-		data, err = ApplyStrategicMerge(data, profiles[i])
-		if err != nil {
-			return nil, err
-		}
-
 		// Apply patches
 		data, err = ApplyPatches(data, profiles[i])
 		if err != nil {
@@ -377,17 +565,6 @@ func (l *configLoader) applyProfiles(data map[interface{}]interface{}, options *
 	}
 
 	return data, nil
-}
-
-func (l *configLoader) newVariableResolver(generatedConfig *generated.Config, options *ConfigOptions, log log.Logger) variable.Resolver {
-	return variable.NewResolver(generatedConfig.Vars, &variable.PredefinedVariableOptions{
-		BasePath:         options.BasePath,
-		ConfigPath:       ConfigPath(l.configPath),
-		KubeContextFlag:  options.KubeContext,
-		NamespaceFlag:    options.Namespace,
-		KubeConfigLoader: l.kubeConfigLoader,
-		Profile:          GetLastProfile(options.Profiles),
-	}, log)
 }
 
 func GetLastProfile(profiles []string) string {
@@ -399,19 +576,14 @@ func GetLastProfile(profiles []string) string {
 
 // configExistsInPath checks whether a devspace configuration exists at a certain path
 func configExistsInPath(path string) bool {
-	// check devspace.yaml
 	_, err := os.Stat(path)
-	if err == nil {
-		return true
-	}
-
-	return false // no config file found
+	return err == nil // false, no config file found
 }
 
 // LoadRaw loads the raw config
-func (l *configLoader) LoadRaw() (map[interface{}]interface{}, error) {
+func (l *configLoader) LoadRaw() (map[string]interface{}, error) {
 	// What path should we use
-	configPath := ConfigPath(l.configPath)
+	configPath := ConfigPath(l.absConfigPath)
 	_, err := os.Stat(configPath)
 	if err != nil {
 		return nil, errors.Errorf("Couldn't load '%s': %v", configPath, err)
@@ -422,10 +594,22 @@ func (l *configLoader) LoadRaw() (map[interface{}]interface{}, error) {
 		return nil, err
 	}
 
-	rawMap := map[interface{}]interface{}{}
-	err = yaml.Unmarshal(fileContent, &rawMap)
+	rawMap := map[string]interface{}{}
+	err = yamlutil.Unmarshal(fileContent, &rawMap)
 	if err != nil {
 		return nil, err
+	}
+
+	name, ok := rawMap["name"].(string)
+	if !ok || name == "" {
+		directoryName := filepath.Base(filepath.Dir(l.absConfigPath))
+		if directoryName != "" && len(directoryName) > 2 {
+			name = encoding.Convert(directoryName)
+		} else {
+			name = "devspace"
+		}
+
+		rawMap["name"] = name
 	}
 
 	return rawMap, nil
@@ -433,22 +617,22 @@ func (l *configLoader) LoadRaw() (map[interface{}]interface{}, error) {
 
 // Exists checks whether the yaml file for the config exists or the configs.yaml exists
 func (l *configLoader) Exists() bool {
-	return configExistsInPath(ConfigPath(l.configPath))
+	return configExistsInPath(ConfigPath(l.absConfigPath))
 }
 
 // SetDevSpaceRoot checks the current directory and all parent directories for a .devspace folder with a config and sets the current working directory accordingly
 func (l *configLoader) SetDevSpaceRoot(log log.Logger) (bool, error) {
-	if l.configPath != "" {
-		configExists := configExistsInPath(l.configPath)
+	if l.absConfigPath != "" {
+		configExists := configExistsInPath(l.absConfigPath)
 		if !configExists {
 			return configExists, nil
 		}
 
-		err := os.Chdir(filepath.Dir(ConfigPath(l.configPath)))
+		err := os.Chdir(filepath.Dir(l.absConfigPath))
 		if err != nil {
 			return false, err
 		}
-		l.configPath = filepath.Base(ConfigPath(l.configPath))
+
 		return true, nil
 	}
 
@@ -499,17 +683,45 @@ func ConfigPath(configPath string) string {
 	return path
 }
 
-func copyRaw(in map[interface{}]interface{}) (map[interface{}]interface{}, error) {
+func copyRaw(in map[string]interface{}) (map[string]interface{}, error) {
 	o, err := yaml.Marshal(in)
 	if err != nil {
 		return nil, err
 	}
 
-	n := map[interface{}]interface{}{}
-	err = yaml.Unmarshal(o, &n)
+	n := map[string]interface{}{}
+	err = yamlutil.Unmarshal(o, &n)
 	if err != nil {
 		return nil, err
 	}
 
 	return n, nil
+}
+
+func copyForValidation(profile interface{}) (*latest.ProfileConfig, error) {
+	profileMap, ok := profile.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("error loading profiles: invalid format")
+	}
+
+	clone := map[string]interface{}{
+		"name":       profileMap["name"],
+		"parent":     profileMap["parent"],
+		"parents":    profileMap["parents"],
+		"patches":    profileMap["patches"],
+		"activation": profileMap["activation"],
+	}
+
+	o, err := yaml.Marshal(clone)
+	if err != nil {
+		return nil, err
+	}
+
+	profileConfig := &latest.ProfileConfig{}
+	err = yamlutil.UnmarshalStrict(o, profileConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return profileConfig, nil
 }

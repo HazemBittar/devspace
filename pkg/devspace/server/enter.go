@@ -1,12 +1,14 @@
 package server
 
 import (
-	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
-	"github.com/pkg/errors"
-	"k8s.io/client-go/tools/remotecommand"
+	context2 "context"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
+	"github.com/pkg/errors"
+	"k8s.io/client-go/tools/remotecommand"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,14 +18,14 @@ import (
 
 func (h *handler) enter(w http.ResponseWriter, r *http.Request) {
 	// Kube Context
-	kubeContext := h.defaultContext
+	kubeContext := h.ctx.KubeClient().CurrentContext()
 	context, ok := r.URL.Query()["context"]
 	if ok && len(context) == 1 && context[0] != "" {
 		kubeContext = context[0]
 	}
 
 	// Namespace
-	kubeNamespace := h.defaultNamespace
+	kubeNamespace := h.ctx.KubeClient().Namespace()
 	namespace, ok := r.URL.Query()["namespace"]
 	if ok && len(namespace) == 1 && namespace[0] != "" {
 		kubeNamespace = namespace[0]
@@ -41,32 +43,32 @@ func (h *handler) enter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var terminalResizeQueue TerminalResizeQueue
-	resizeId, ok := r.URL.Query()["resize_id"]
-	if ok && len(resizeId) == 1 {
+	resizeID, ok := r.URL.Query()["resize_id"]
+	if ok && len(resizeID) == 1 {
 		h.terminalResizeQueuesMutex.Lock()
 		terminalResizeQueue = newTerminalSizeQueue()
-		h.terminalResizeQueues[resizeId[0]] = terminalResizeQueue
+		h.terminalResizeQueues[resizeID[0]] = terminalResizeQueue
 		h.terminalResizeQueuesMutex.Unlock()
 
 		defer func() {
 			h.terminalResizeQueuesMutex.Lock()
 			defer h.terminalResizeQueuesMutex.Unlock()
 
-			delete(h.terminalResizeQueues, resizeId[0])
+			delete(h.terminalResizeQueues, resizeID[0])
 		}()
 	}
 
 	// Create kubectl client
 	client, err := h.getClientFromCache(kubeContext, kubeNamespace)
 	if err != nil {
-		h.log.Errorf("Error in %s: %v", r.URL.String(), err)
+		h.ctx.Log().Errorf("Error in %s: %v", r.URL.String(), err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		h.log.Errorf("Error upgrading connection: %v", err)
+		h.ctx.Log().Errorf("Error upgrading connection: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -75,7 +77,7 @@ func (h *handler) enter(w http.ResponseWriter, r *http.Request) {
 
 	// Open logs connection
 	stream := &wsStream{WebSocket: ws}
-	err = client.ExecStream(&kubectl.ExecStreamOptions{
+	err = client.ExecStream(context2.Background(), &kubectl.ExecStreamOptions{
 		Pod: &v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      name[0],
@@ -92,18 +94,18 @@ func (h *handler) enter(w http.ResponseWriter, r *http.Request) {
 		Stderr:            stream,
 	})
 	if err != nil {
-		h.log.Errorf("Error in %s: %v", r.URL.String(), err)
+		h.ctx.Log().Errorf("Error in %s: %v", r.URL.String(), err)
 		websocketError(ws, err)
 		return
 	}
 
-	ws.SetWriteDeadline(time.Now().Add(time.Second * 5))
-	ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	_ = ws.SetWriteDeadline(time.Now().Add(time.Second * 5))
+	_ = ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 }
 
 func (h *handler) resize(w http.ResponseWriter, r *http.Request) {
-	resizeId, ok := r.URL.Query()["resize_id"]
-	if !ok || len(resizeId) != 1 {
+	resizeID, ok := r.URL.Query()["resize_id"]
+	if !ok || len(resizeID) != 1 {
 		http.Error(w, "resize_id is missing", http.StatusBadRequest)
 		return
 	}
@@ -131,7 +133,7 @@ func (h *handler) resize(w http.ResponseWriter, r *http.Request) {
 	h.terminalResizeQueuesMutex.Lock()
 	defer h.terminalResizeQueuesMutex.Unlock()
 
-	resizeQueue, ok := h.terminalResizeQueues[resizeId[0]]
+	resizeQueue, ok := h.terminalResizeQueues[resizeID[0]]
 	if !ok {
 		http.Error(w, "resize_id does not exist", http.StatusBadRequest)
 		return

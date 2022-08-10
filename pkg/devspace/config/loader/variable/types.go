@@ -1,29 +1,46 @@
 package variable
 
-import "github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
+import (
+	"context"
+	"github.com/loft-sh/devspace/pkg/devspace/config"
+	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
+	"github.com/loft-sh/devspace/pkg/devspace/dependency/types"
+)
 
 // Variable defines an interface to load a variable
 type Variable interface {
-	Load(definition *latest.Variable) (interface{}, error)
+	Load(ctx context.Context, definition *latest.Variable) (interface{}, error)
+}
+
+// RuntimeResolver fills in runtime variables and cached ones
+type RuntimeResolver interface {
+	// FillRuntimeVariables finds the used variables first and then fills in those in the haystack
+	FillRuntimeVariables(haystack interface{}, config config.Config, dependencies []types.Dependency) (interface{}, error)
+
+	// FillRuntimeVariablesWithRebuild finds the used variables first and then fills in those in the haystack
+	FillRuntimeVariablesWithRebuild(haystack interface{}, config config.Config, dependencies []types.Dependency, builtImages map[string]string) (bool, interface{}, error)
 }
 
 // Resolver defines an interface to resolve defined variables
 type Resolver interface {
-	// Resolves a single variable by name and possible definition
-	Resolve(name string, definition *latest.Variable) (interface{}, error)
+	// DefinedVars returns the defined variables
+	DefinedVars() map[string]*latest.Variable
 
-	// Convert several variables from input flags in the form of varname=value
-	ConvertFlags(flags []string) (map[string]interface{}, error)
+	// UpdateVars sets the defined variables to use in the resolver
+	UpdateVars(vars map[string]*latest.Variable)
 
 	// FindVariables returns all variable names that were found in the given map
-	FindVariables(haystack map[interface{}]interface{}, vars []*latest.Variable) (map[string]bool, error)
+	FindVariables(haystack interface{}) ([]*latest.Variable, error)
 
-	// FillVariables walks over the haystack and replaces all encountered variables
-	FillVariables(haystack map[interface{}]interface{}) error
+	// FillVariables finds the used variables first and then fills in those in the haystack
+	FillVariables(ctx context.Context, haystack interface{}) (interface{}, error)
 
-	// Replaces all variables in a string and returns either a string, integer or boolean
-	ReplaceString(str string) (interface{}, error)
+	// FillVariablesExclude finds the used variables first and then fills in those that do not match the excluded paths in the haystack
+	FillVariablesExclude(ctx context.Context, haystack interface{}, excluded []string) (interface{}, error)
 
-	// Returns the internal memory cache of the resolver with the resolved variables
+	// FillVariablesInclude finds the used variables first and then fills in those that match the included paths in the haystack
+	FillVariablesInclude(ctx context.Context, haystack interface{}, included []string) (interface{}, error)
+
+	// ResolvedVariables returns the internal memory cache of the resolver with all resolved variables
 	ResolvedVariables() map[string]interface{}
 }

@@ -10,70 +10,126 @@ import (
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	"github.com/loft-sh/devspace/pkg/devspace/config/loader/patch"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
-	"github.com/loft-sh/devspace/pkg/devspace/config/versions/util"
 	"github.com/pkg/errors"
 	"github.com/vmware-labs/yaml-jsonpath/pkg/yamlpath"
 	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 )
 
-// ApplyStrategicMerge applies the strategic merge patches
-func ApplyStrategicMerge(config map[interface{}]interface{}, profile map[interface{}]interface{}) (map[interface{}]interface{}, error) {
-	if profile == nil || profile["strategicMerge"] == nil {
+// ApplyMerge applies the merge patches
+func ApplyMerge(config map[string]interface{}, profile *latest.ProfileConfig) (map[string]interface{}, error) {
+	if profile == nil || profile.Merge == nil {
 		return config, nil
 	}
 
-	mergeMap, ok := profile["strategicMerge"].(map[interface{}]interface{})
-	if !ok {
-		return nil, errors.Errorf("profiles.%v.strategicMerge is not an object", profile["name"])
+	var err error
+	if profile.Merge.Hooks != nil {
+		config, err = applyMerge(config, "hooks", *profile.Merge.Hooks)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.Images != nil {
+		config, err = applyMerge(config, "images", *profile.Merge.Images)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.Dev != nil {
+		config, err = applyMerge(config, "dev", *profile.Merge.Dev)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.Deployments != nil {
+		config, err = applyMerge(config, "deployments", *profile.Merge.Deployments)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.OldDeployments != nil {
+		config, err = applyMerge(config, "deployments", *profile.Merge.OldDeployments)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.Vars != nil {
+		config, err = applyMerge(config, "vars", *profile.Merge.Vars)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.OldVars != nil {
+		config, err = applyMerge(config, "vars", *profile.Merge.OldVars)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.Dependencies != nil {
+		config, err = applyMerge(config, "dependencies", *profile.Merge.Dependencies)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.OldDependencies != nil {
+		config, err = applyMerge(config, "dependencies", *profile.Merge.OldDependencies)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.PullSecrets != nil {
+		config, err = applyMerge(config, "pullSecrets", *profile.Merge.PullSecrets)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.OldPullSecrets != nil {
+		config, err = applyMerge(config, "pullSecrets", *profile.Merge.OldPullSecrets)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.Commands != nil {
+		config, err = applyMerge(config, "commands", *profile.Merge.Commands)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if profile.Merge.OldCommands != nil {
+		config, err = applyMerge(config, "commands", *profile.Merge.OldCommands)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	mergeBytes, err := json.Marshal(convertFrom(mergeMap))
-	if err != nil {
-		return nil, errors.Wrap(err, "marshal merge")
-	}
-
-	originalBytes, err := json.Marshal(convertFrom(config))
-	if err != nil {
-		return nil, errors.Wrap(err, "marshal merge")
-	}
-
-	schema, err := strategicpatch.NewPatchMetaFromStruct(&latest.Config{})
-	if err != nil {
-		return nil, err
-	}
-
-	out, err := strategicpatch.StrategicMergePatchUsingLookupPatchMeta(originalBytes, mergeBytes, PatchMetaFromStruct{PatchMetaFromStruct: schema})
-	if err != nil {
-		return nil, errors.Wrap(err, "create strategic merge patch")
-	}
-
-	strMap := map[string]interface{}{}
-	err = json.Unmarshal(out, &strMap)
-	if err != nil {
-		return nil, err
-	}
-
-	return convertBack(strMap).(map[interface{}]interface{}), nil
+	return config, nil
 }
 
-// ApplyMerge applies the merge patches
-func ApplyMerge(config map[interface{}]interface{}, profile map[interface{}]interface{}) (map[interface{}]interface{}, error) {
-	if profile == nil || profile["merge"] == nil {
+func applyMerge(config map[string]interface{}, key string, value interface{}) (map[string]interface{}, error) {
+	if value == nil {
 		return config, nil
 	}
-
-	mergeMap, ok := profile["merge"].(map[interface{}]interface{})
-	if !ok {
-		return nil, errors.Errorf("profiles.%v.merge is not an object", profile["name"])
+	switch t := value.(type) {
+	case []interface{}:
+		if t == nil {
+			return config, nil
+		}
+	case map[string]interface{}:
+		if t == nil {
+			return config, nil
+		}
 	}
 
-	mergeBytes, err := json.Marshal(convertFrom(mergeMap))
+	mergeObj := map[string]interface{}{
+		key: value,
+	}
+
+	mergeBytes, err := json.Marshal(mergeObj)
 	if err != nil {
 		return nil, errors.Wrap(err, "marshal merge")
 	}
 
-	originalBytes, err := json.Marshal(convertFrom(config))
+	originalBytes, err := json.Marshal(config)
 	if err != nil {
 		return nil, errors.Wrap(err, "marshal merge")
 	}
@@ -89,51 +145,84 @@ func ApplyMerge(config map[interface{}]interface{}, profile map[interface{}]inte
 		return nil, err
 	}
 
-	return convertBack(strMap).(map[interface{}]interface{}), nil
+	return strMap, nil
 }
 
 // ApplyReplace applies the replaces
-func ApplyReplace(config map[interface{}]interface{}, profile map[interface{}]interface{}) error {
-	if profile == nil || profile["replace"] == nil {
+func ApplyReplace(config map[string]interface{}, profile *latest.ProfileConfig) error {
+	if profile == nil || profile.Replace == nil {
 		return nil
 	}
 
-	replaceMap, ok := profile["replace"].(map[interface{}]interface{})
-	if !ok {
-		return errors.Errorf("profiles.%v.replace is not an object", profile["name"])
+	if profile.Replace.Commands != nil {
+		setKey(config, "commands", *profile.Replace.Commands)
 	}
-
-	for k, v := range replaceMap {
-		config[k] = v
+	if profile.Replace.OldCommands != nil {
+		setKey(config, "commands", *profile.Replace.OldCommands)
 	}
-
+	if profile.Replace.Deployments != nil {
+		setKey(config, "deployments", *profile.Replace.Deployments)
+	}
+	if profile.Replace.OldDeployments != nil {
+		setKey(config, "deployments", *profile.Replace.OldDeployments)
+	}
+	if profile.Replace.Vars != nil {
+		setKey(config, "vars", *profile.Replace.Vars)
+	}
+	if profile.Replace.OldVars != nil {
+		setKey(config, "vars", *profile.Replace.OldVars)
+	}
+	if profile.Replace.Images != nil {
+		setKey(config, "images", *profile.Replace.Images)
+	}
+	if profile.Replace.Dependencies != nil {
+		setKey(config, "dependencies", *profile.Replace.Dependencies)
+	}
+	if profile.Replace.OldDependencies != nil {
+		setKey(config, "dependencies", *profile.Replace.OldDependencies)
+	}
+	if profile.Replace.Dev != nil {
+		setKey(config, "dev", *profile.Replace.Dev)
+	}
+	if profile.Replace.Hooks != nil {
+		setKey(config, "hooks", *profile.Replace.Hooks)
+	}
+	if profile.Replace.PullSecrets != nil {
+		setKey(config, "pullSecrets", *profile.Replace.PullSecrets)
+	}
+	if profile.Replace.OldPullSecrets != nil {
+		setKey(config, "pullSecrets", *profile.Replace.OldPullSecrets)
+	}
 	return nil
 }
 
-// ApplyPatches applies the patches to the config if defined
-func ApplyPatches(data map[interface{}]interface{}, profile map[interface{}]interface{}) (map[interface{}]interface{}, error) {
-	patchesRaw, ok := profile["patches"]
-	if !ok {
-		return data, nil
-	}
+func setKey(m map[string]interface{}, key string, value interface{}) {
+	if value != nil {
+		switch t := value.(type) {
+		case []interface{}:
+			if t == nil {
+				return
+			}
+		case map[string]interface{}:
+			if t == nil {
+				return
+			}
+		}
 
-	patchesArr, ok := patchesRaw.([]interface{})
-	if !ok {
-		return nil, errors.Errorf("profile.%v.patches is not an array", profile["name"])
-	} else if len(patchesArr) == 0 {
-		return data, nil
+		m[key] = value
 	}
-
-	configPatches := []*latest.PatchConfig{}
-	err := util.Convert(patchesArr, &configPatches)
-	if err != nil {
-		return nil, errors.Wrap(err, "convert patches")
-	}
-
-	return ApplyPatchesOnObject(data, configPatches)
 }
 
-func ApplyPatchesOnObject(data map[interface{}]interface{}, configPatches []*latest.PatchConfig) (map[interface{}]interface{}, error) {
+// ApplyPatches applies the patches to the config if defined
+func ApplyPatches(data map[string]interface{}, profile *latest.ProfileConfig) (map[string]interface{}, error) {
+	if profile == nil || len(profile.Patches) == 0 {
+		return data, nil
+	}
+
+	return ApplyPatchesOnObject(data, profile.Patches)
+}
+
+func ApplyPatchesOnObject(data map[string]interface{}, configPatches []*latest.PatchConfig) (map[string]interface{}, error) {
 	out, err := yaml.Marshal(data)
 	if err != nil {
 		return nil, err
@@ -189,7 +278,7 @@ func ApplyPatchesOnObject(data map[interface{}]interface{}, configPatches []*lat
 		return nil, errors.Wrap(err, "apply patches")
 	}
 
-	newConfig := map[interface{}]interface{}{}
+	newConfig := map[string]interface{}{}
 	err = yaml.Unmarshal(out, &newConfig)
 	if err != nil {
 		return nil, err
@@ -221,6 +310,7 @@ var hasFilterRegEx = regexp.MustCompile(`(?i)\[\?.*\)\]`)
 var indexXPathRegEx = regexp.MustCompile(`\/(\d+|\*)\/`)
 var trailingIndexXPathRegEx = regexp.MustCompile(`\/(\d+|\*)$`)
 var rootXPathRegEx = regexp.MustCompile(`^\/`)
+var numeric = regexp.MustCompile(`^\d+$`)
 
 func transformPath(path string) string {
 	if path == "" {
@@ -237,7 +327,11 @@ func transformPath(path string) string {
 			rewriteToken := token
 			if legacyExtendedSyntaxRegEx.MatchString(token) {
 				filterTokens := legacyExtendedSyntaxRegEx.FindStringSubmatch(token)
-				rewriteToken = fmt.Sprintf("[?(@.%s=='%s')]", filterTokens[1], filterTokens[2])
+				if numeric.MatchString((filterTokens[2])) {
+					rewriteToken = fmt.Sprintf("[?(@.%s=='%s' || @.%s==%s)]", filterTokens[1], filterTokens[2], filterTokens[1], filterTokens[2])
+				} else {
+					rewriteToken = fmt.Sprintf("[?(@.%s=='%s')]", filterTokens[1], filterTokens[2])
+				}
 			}
 			rewriteTokens = append(rewriteTokens, rewriteToken)
 		}
@@ -251,57 +345,6 @@ func transformPath(path string) string {
 	}
 
 	return rewrittenPath
-}
-
-func convertBack(v interface{}) interface{} {
-	switch x := v.(type) {
-	case map[string]interface{}:
-		m := map[interface{}]interface{}{}
-		for k, v2 := range x {
-			m[k] = convertBack(v2)
-		}
-		v = m
-
-	case []interface{}:
-		for i, v2 := range x {
-			x[i] = convertBack(v2)
-		}
-
-	case map[interface{}]interface{}:
-		for k, v2 := range x {
-			x[k] = convertBack(v2)
-		}
-	}
-
-	return v
-}
-
-func convertFrom(v interface{}) interface{} {
-	switch x := v.(type) {
-	case map[interface{}]interface{}:
-		m := map[string]interface{}{}
-		for k, v2 := range x {
-			switch k2 := k.(type) {
-			case string: // Fast check if it's already a string
-				m[k2] = convertFrom(v2)
-			default:
-				m[fmt.Sprint(k)] = convertFrom(v2)
-			}
-		}
-		v = m
-
-	case []interface{}:
-		for i, v2 := range x {
-			x[i] = convertFrom(v2)
-		}
-
-	case map[string]interface{}:
-		for k, v2 := range x {
-			x[k] = convertFrom(v2)
-		}
-	}
-
-	return v
 }
 
 type PatchMetaFromStruct struct {

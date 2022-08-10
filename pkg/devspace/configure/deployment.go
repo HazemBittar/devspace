@@ -1,83 +1,98 @@
 package configure
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"mvdan.cc/sh/v3/expand"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strings"
 
+	"github.com/loft-sh/devspace/pkg/devspace/deploy/deployer/helm"
+	"github.com/loft-sh/devspace/pkg/devspace/pipeline/engine"
+	"github.com/sirupsen/logrus"
+
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
-	v1 "github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
-	"github.com/loft-sh/devspace/pkg/devspace/hook"
 	"github.com/loft-sh/devspace/pkg/util/ptr"
-	"github.com/loft-sh/devspace/pkg/util/shell"
 	"github.com/loft-sh/devspace/pkg/util/survey"
 	"github.com/loft-sh/devspace/pkg/util/yamlutil"
 )
 
-var imageNameCleaningRegex = regexp.MustCompile("[^a-z0-9]")
-
 // AddKubectlDeployment adds a new kubectl deployment to the provided config
 func (m *manager) AddKubectlDeployment(deploymentName string, isKustomization bool) error {
-	for true {
-		question := "Please enter the paths to your Kubernetes manifests (comma separated, glob patterns are allowed, e.g. 'manifests/**' or 'kube/pod.yaml')"
-		if isKustomization {
-			question = "Please enter path to your Kustomization folder (e.g. ./kube/kustomization/)"
-		}
-
-		manifests, err := m.log.Question(&survey.QuestionOptions{
-			Question: question,
-			ValidationFunc: func(value string) error {
-				if isKustomization {
-					stat, err := os.Stat(path.Join(value, "kustomization.yaml"))
-					if err == nil && stat.IsDir() == false {
-						return nil
-					}
-					return errors.New(fmt.Sprintf("Path `%s` is not a Kustomization (kustomization.yaml missing)", value))
-				}
-				return nil
-			},
-		})
-		if err != nil {
-			return err
-		}
-
-		splitted := strings.Split(manifests, ",")
-		splittedPointer := []string{}
-
-		for _, s := range splitted {
-			trimmed := strings.TrimSpace(s)
-			splittedPointer = append(splittedPointer, trimmed)
-		}
-
-		m.config.Deployments = append([]*v1.DeploymentConfig{
-			{
-				Name: deploymentName,
-				Kubectl: &v1.KubectlConfig{
-					Manifests: splittedPointer,
-				},
-			},
-		}, m.config.Deployments...)
-
-		if isKustomization {
-			m.config.Deployments[0].Kubectl.Kustomize = ptr.Bool(isKustomization)
-		}
-
-		break
+	question := "Please enter the paths to your Kubernetes manifests (comma separated, glob patterns are allowed, e.g. 'manifests/**' or 'kube/pod.yaml') [Enter to abort]"
+	if isKustomization {
+		question = "Please enter path to your Kustomization folder (e.g. ./kube/kustomization/)"
 	}
+
+	manifests, err := m.log.Question(&survey.QuestionOptions{
+		Question: question,
+		ValidationFunc: func(value string) error {
+			if value == "" {
+				return nil
+			}
+
+			if isKustomization {
+				stat, err := os.Stat(path.Join(value, "kustomization.yaml"))
+				if err == nil && !stat.IsDir() {
+					return nil
+				}
+				return fmt.Errorf("path `%s` is not a Kustomization (kustomization.yaml missing)", value)
+			} else {
+				matches, err := filepath.Glob(value)
+				if err != nil {
+					return fmt.Errorf("path `%s` is not a valid glob pattern", value)
+				}
+				if len(matches) == 0 {
+					return fmt.Errorf("path `%s` did not match any manifests", value)
+				}
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	if manifests == "" {
+		return fmt.Errorf("adding kubectl deployment aborted")
+	}
+
+	splitted := strings.Split(manifests, ",")
+	splittedPointer := []string{}
+
+	for _, s := range splitted {
+		trimmed := strings.TrimSpace(s)
+		splittedPointer = append(splittedPointer, trimmed)
+	}
+
+	if m.config.Deployments == nil {
+		m.config.Deployments = map[string]*latest.DeploymentConfig{}
+	}
+	m.config.Deployments[deploymentName] = &latest.DeploymentConfig{
+		Name: deploymentName,
+		Kubectl: &latest.KubectlConfig{
+			Manifests: splittedPointer,
+		},
+	}
+	if isKustomization {
+		m.config.Deployments[deploymentName].Kubectl.Kustomize = ptr.Bool(isKustomization)
+	}
+	m.isRemote[deploymentName] = false
+
 	return nil
 }
 
 // AddHelmDeployment adds a new helm deployment to the provided config
 func (m *manager) AddHelmDeployment(deploymentName string) error {
-	for true {
-		helmConfig := &v1.HelmConfig{
-			Chart: &v1.ChartConfig{},
-			Values: map[interface{}]interface{}{
+	for {
+		helmConfig := &latest.HelmConfig{
+			Chart: &latest.ChartConfig{},
+			Values: map[string]interface{}{
 				"someChartValue": "",
 			},
 		}
@@ -128,27 +143,36 @@ func (m *manager) AddHelmDeployment(deploymentName string) error {
 
 			stat, err := os.Stat(path.Join(localChartPathRel, "Chart.yaml"))
 			if err != nil || stat.IsDir() {
-				m.log.WriteString("\n")
+				m.log.WriteString(logrus.InfoLevel, "\n")
 				m.log.Errorf("Local path `%s` is not a Helm chart (Chart.yaml missing)", localChartPathRel)
 				continue
 			}
 
 			helmConfig.Chart.Name = localChartPathRel
+			m.isRemote[deploymentName] = false
 		} else if chartLocation == chartRepo || chartLocation == archiveURL {
 		ChartRepoLoop:
-			for true {
+			for {
 				requestURL := ""
 
 				if chartLocation == chartRepo {
-					helmConfig.Chart.RepoURL, err = m.log.Question(&survey.QuestionOptions{
-						Question:               "Please specify the full URL of the chart repo (e.g. https://charts.org.tld/)",
-						ValidationRegexPattern: "^http(s)?://.*",
+					tempChartRepoURL, err := m.log.Question(&survey.QuestionOptions{
+						Question: "Please specify the full URL of the chart repo (e.g. https://charts.org.tld/)",
+						ValidationFunc: func(value string) error {
+							_, err := url.ParseRequestURI(chartRepoURL(value))
+							if err != nil {
+								return err
+							}
+							return nil
+						},
 					})
 					if err != nil {
 						return err
 					}
 
-					requestURL = helmConfig.Chart.RepoURL + "/index.yaml"
+					helmConfig.Chart.RepoURL = chartRepoURL(tempChartRepoURL)
+
+					requestURL = strings.TrimRight(helmConfig.Chart.RepoURL, "/") + "/index.yaml"
 
 					helmConfig.Chart.Name, err = m.log.Question(&survey.QuestionOptions{
 						Question:               "Please specify the name of the chart within your chart repository (e.g. payment-service)",
@@ -172,7 +196,7 @@ func (m *manager) AddHelmDeployment(deploymentName string) error {
 				username := ""
 				password := ""
 
-				for true {
+				for {
 					httpClient := &http.Client{}
 					req, err := http.NewRequest("GET", requestURL, nil)
 					if err != nil {
@@ -216,21 +240,25 @@ func (m *manager) AddHelmDeployment(deploymentName string) error {
 							helmConfig.Chart.Username = fmt.Sprintf("${%s}", usernameVar)
 							helmConfig.Chart.Password = fmt.Sprintf("${%s}", passwordVar)
 
-							m.config.Vars = append(m.config.Vars, &v1.Variable{
+							if m.config.Vars == nil {
+								m.config.Vars = map[string]*latest.Variable{}
+							}
+							m.config.Vars[passwordVar] = &latest.Variable{
 								Name:     passwordVar,
 								Password: true,
-							})
+							}
 
-							m.generated.Vars[usernameVar] = username
-							m.generated.Vars[passwordVar] = password
+							m.localCache.SetVar(usernameVar, username)
+							m.localCache.SetVar(passwordVar, password)
 						}
 
+						m.isRemote[deploymentName] = true
 						break ChartRepoLoop
 					}
 				}
 			}
 		} else {
-			for true {
+			for {
 				chartTempPath := ".devspace/chart-repo"
 
 				gitRepo, err := m.log.Question(&survey.QuestionOptions{
@@ -257,44 +285,42 @@ func (m *manager) AddHelmDeployment(deploymentName string) error {
 
 				gitCommand := fmt.Sprintf("if [ -d '%s/.git' ]; then cd \"%s\" && git pull origin %s; else mkdir -p %s; git clone --single-branch --branch %s %s %s; fi", chartTempPath, chartTempPath, gitBranch, chartTempPath, gitBranch, gitRepo, chartTempPath)
 
-				m.log.WriteString("\n")
+				m.log.WriteString(logrus.InfoLevel, "\n")
 				m.log.Infof("Cloning external repo `%s` containing to retrieve Helm chart", gitRepo)
 
-				err = shell.ExecuteShellCommand(gitCommand, nil, "", os.Stdout, os.Stderr, nil)
+				err = engine.ExecuteSimpleShellCommand(context.TODO(), "", expand.ListEnviron(os.Environ()...), os.Stdout, os.Stderr, nil, gitCommand)
 				if err != nil {
-					m.log.WriteString("\n")
+					m.log.WriteString(logrus.InfoLevel, "\n")
 					m.log.Errorf("Unable to clone repository `%s` (branch: %s)", gitRepo, gitBranch)
 					continue
 				}
 
 				chartFolder := path.Join(chartTempPath, gitSubFolder)
 				stat, err := os.Stat(chartFolder)
-				if err != nil || stat.IsDir() == false {
-					m.log.WriteString("\n")
+				if err != nil || !stat.IsDir() {
+					m.log.WriteString(logrus.InfoLevel, "\n")
 					m.log.Errorf("Local path `%s` does not exist or is not a directory", chartFolder)
 					continue
 				}
 
 				helmConfig.Chart.Name = chartFolder
-				m.config.Hooks = append(m.config.Hooks, &v1.HookConfig{
+				m.config.Hooks = append(m.config.Hooks, &latest.HookConfig{
 					Command: gitCommand,
-					When: &v1.HookWhenConfig{
-						Before: &v1.HookWhenAtConfig{
-							Deployments: hook.All,
-						},
-					},
+					Events:  []string{"before:deploy"},
 				})
 
+				m.isRemote[deploymentName] = true
 				break
 			}
 		}
 
-		m.config.Deployments = append([]*v1.DeploymentConfig{
-			{
-				Name: deploymentName,
-				Helm: helmConfig,
-			},
-		}, m.config.Deployments...)
+		if m.config.Deployments == nil {
+			m.config.Deployments = map[string]*latest.DeploymentConfig{}
+		}
+		m.config.Deployments[deploymentName] = &latest.DeploymentConfig{
+			Name: deploymentName,
+			Helm: helmConfig,
+		}
 
 		break
 	}
@@ -313,8 +339,8 @@ func (m *manager) AddComponentDeployment(deploymentName, image string, servicePo
 	}
 
 	if servicePort > 0 {
-		componentConfig.Service = &v1.ServiceConfig{
-			Ports: []*v1.ServicePortConfig{
+		componentConfig.Service = &latest.ServiceConfig{
+			Ports: []*latest.ServicePortConfig{
 				{
 					Port: &servicePort,
 				},
@@ -327,15 +353,31 @@ func (m *manager) AddComponentDeployment(deploymentName, image string, servicePo
 		return err
 	}
 
-	m.config.Deployments = append([]*v1.DeploymentConfig{
-		{
-			Name: deploymentName,
-			Helm: &v1.HelmConfig{
-				ComponentChart: ptr.Bool(true),
-				Values:         chartValues,
+	if m.config.Deployments == nil {
+		m.config.Deployments = map[string]*latest.DeploymentConfig{}
+	}
+	m.config.Deployments[deploymentName] = &latest.DeploymentConfig{
+		Helm: &latest.HelmConfig{
+			Chart: &latest.ChartConfig{
+				Name:    helm.DevSpaceChartConfig.Name,
+				RepoURL: helm.DevSpaceChartConfig.RepoURL,
 			},
+			Values: chartValues,
 		},
-	}, m.config.Deployments...)
+	}
+	m.isRemote[deploymentName] = true
 
 	return nil
+}
+
+func (m *manager) IsRemoteDeployment(deploymentName string) bool {
+	return m.isRemote[deploymentName]
+}
+
+func chartRepoURL(url string) string {
+	repoURL := url
+	if !(strings.HasPrefix(url, "https://") || strings.HasPrefix(url, "http://")) {
+		repoURL = "https://" + url
+	}
+	return repoURL
 }

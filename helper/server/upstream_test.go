@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 package server
@@ -37,23 +38,23 @@ type testFile struct {
 
 var fileStructure = testFile{
 	Children: map[string]testFile{
-		"test.txt": testFile{
+		"test.txt": {
 			Data: random(10),
 		},
-		"emptydir": testFile{
+		"emptydir": {
 			Children: map[string]testFile{},
 		},
-		"emptydir2": testFile{
+		"emptydir2": {
 			Children: map[string]testFile{},
 		},
-		"dir1": testFile{
+		"dir1": {
 			Children: map[string]testFile{
-				"dir1-child": testFile{
+				"dir1-child": {
 					Children: map[string]testFile{
-						"test": testFile{
+						"test": {
 							Data: random(100),
 						},
-						"test-123": testFile{
+						"test-123": {
 							Data: []byte{},
 						},
 					},
@@ -65,7 +66,7 @@ var fileStructure = testFile{
 
 var overwriteFileStructure = testFile{
 	Children: map[string]testFile{
-		"test.txt": testFile{
+		"test.txt": {
 			Data: random(10),
 		},
 	},
@@ -141,19 +142,10 @@ func createFiles(dir string, file testFile) error {
 }
 
 func TestUpstreamServer(t *testing.T) {
-	fromDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	toDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fromDir := t.TempDir()
+	toDir := t.TempDir()
 
-	defer os.RemoveAll(fromDir)
-	defer os.RemoveAll(toDir)
-
-	err = createFiles(fromDir, fileStructure)
+	err := createFiles(fromDir, fileStructure)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +190,7 @@ func TestUpstreamServer(t *testing.T) {
 			ExitOnClose: false,
 		})
 		if err != nil {
-			t.Fatal(err)
+			panic(err)
 		}
 	}()
 
@@ -253,7 +245,7 @@ func TestUpstreamServer(t *testing.T) {
 	}
 
 	for path := range fileStructure.Children {
-		removeClient.Send(&remote.Paths{
+		_ = removeClient.Send(&remote.Paths{
 			Paths: []string{path, path},
 		})
 	}

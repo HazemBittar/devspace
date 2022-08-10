@@ -1,7 +1,23 @@
 package cmd
 
 import (
+	"context"
 	"flag"
+	"fmt"
+	"github.com/loft-sh/devspace/pkg/devspace/config/loader"
+	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
+	"github.com/loft-sh/devspace/pkg/devspace/env"
+	"github.com/loft-sh/devspace/pkg/util/log"
+	"github.com/loft-sh/devspace/pkg/util/message"
+	"io/ioutil"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/loft-sh/devspace/pkg/devspace/hook"
+	"github.com/loft-sh/devspace/pkg/util/interrupt"
+
 	"github.com/joho/godotenv"
 	"github.com/loft-sh/devspace/cmd/add"
 	"github.com/loft-sh/devspace/cmd/cleanup"
@@ -9,8 +25,6 @@ import (
 	"github.com/loft-sh/devspace/cmd/list"
 	"github.com/loft-sh/devspace/cmd/remove"
 	"github.com/loft-sh/devspace/cmd/reset"
-	"github.com/loft-sh/devspace/cmd/restore"
-	"github.com/loft-sh/devspace/cmd/save"
 	"github.com/loft-sh/devspace/cmd/set"
 	"github.com/loft-sh/devspace/cmd/update"
 	"github.com/loft-sh/devspace/cmd/use"
@@ -24,11 +38,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"io/ioutil"
 	"k8s.io/klog"
-	"os"
-	"strings"
-	"time"
+	klogv2 "k8s.io/klog/v2"
 )
 
 // NewRootCmd returns a new root command
@@ -52,18 +63,27 @@ func NewRootCmd(f factory.Factory) *cobra.Command {
 			}
 
 			// parse the .env file
-			err := godotenv.Load()
-			if err != nil && os.IsNotExist(err) == false {
-				log.Warnf("Error loading .env: %v", err)
+			envFile := env.GlobalGetEnv("DEVSPACE_ENV_FILE")
+			if envFile != "" {
+				err := godotenv.Load(envFile)
+				if err != nil && !os.IsNotExist(err) {
+					log.Warnf("Error loading .env: %v", err)
+				}
 			}
 
 			// apply extra flags
-			if cobraCmd.DisableFlagParsing == false {
+			if !cobraCmd.DisableFlagParsing {
 				extraFlags, err := flagspkg.ApplyExtraFlags(cobraCmd, os.Args, false)
 				if err != nil {
 					log.Warnf("Error applying extra flags: %v", err)
 				} else if len(extraFlags) > 0 {
-					log.Infof("Applying extra flags from environment: %s", strings.Join(extraFlags, " "))
+					log.Debugf("Applying extra flags from environment: %s", strings.Join(extraFlags, " "))
+				}
+
+				if globalFlags.Silent {
+					log.SetLevel(logrus.FatalLevel)
+				} else if globalFlags.Debug {
+					log.SetLevel(logrus.DebugLevel)
 				}
 
 				// call inactivity timeout
@@ -77,17 +97,14 @@ func NewRootCmd(f factory.Factory) *cobra.Command {
 				}
 			}
 
-			// call root plugin hook
-			err = plugin.ExecutePluginHook("root")
-			if err != nil {
-				return err
-			}
-
 			return nil
 		},
 		Long: `DevSpace accelerates developing, deploying and debugging applications with Docker and Kubernetes. Get started by running the init command in one of your projects:
 	
-		devspace init`,
+		devspace init
+		# Develop an existing application
+		devspace dev
+		DEVSPACE_CONFIG=other-config.yaml devspace dev`,
 	}
 }
 
@@ -96,6 +113,8 @@ var globalFlags *flags.GlobalFlags
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
+	interrupt.Global.Start()
+
 	// disable klog
 	disableKlog()
 
@@ -108,14 +127,17 @@ func Execute() {
 	// set version for --version flag
 	rootCmd.Version = upgrade.GetVersion()
 
-	// call root plugin hook
-	err := plugin.ExecutePluginHook("root.beforeExecute")
-	if err != nil {
-		f.GetLog().Fatal(err)
+	// before hooks
+	pluginErr := hook.ExecuteHooks(nil, nil, "root", "root.beforeExecute", "command:before:execute")
+	if pluginErr != nil {
+		f.GetLog().Fatalf("%+v", pluginErr)
 	}
 
 	// execute command
-	err = rootCmd.Execute()
+	err := rootCmd.Execute()
+
+	// after hooks
+	pluginErr = hook.ExecuteHooks(nil, map[string]interface{}{"error": err}, "root.afterExecute", "command:after:execute")
 	if err != nil {
 		// Check if return code error
 		retCode, ok := errors.Cause(err).(*exit.ReturnCodeError)
@@ -123,12 +145,10 @@ func Execute() {
 			os.Exit(retCode.ExitCode)
 		}
 
-		// call root plugin hook
-		pluginErr := plugin.ExecutePluginHookWithContext("root.errorExecution", map[string]interface{}{
-			"error": err,
-		})
+		// error hooks
+		pluginErr := hook.ExecuteHooks(nil, map[string]interface{}{"error": err}, "root.errorExecution", "command:error")
 		if pluginErr != nil {
-			f.GetLog().Fatal(pluginErr)
+			f.GetLog().Fatalf("%+v", pluginErr)
 		}
 
 		if globalFlags.Debug {
@@ -136,12 +156,8 @@ func Execute() {
 		} else {
 			f.GetLog().Fatal(err)
 		}
-	}
-
-	// call root plugin hook
-	err = plugin.ExecutePluginHook("root.afterExecute")
-	if err != nil {
-		f.GetLog().Fatal(err)
+	} else if pluginErr != nil {
+		f.GetLog().Fatalf("%+v", pluginErr)
 	}
 }
 
@@ -161,10 +177,63 @@ func BuildRoot(f factory.Factory, excludePlugins bool) *cobra.Command {
 		plugin.SetPlugins(plugins)
 	}
 
+	// try to parse the raw config
+	rawConfig, err := parseConfig(f)
+	if err != nil {
+		f.GetLog().Debugf("error parsing raw config: %v", err)
+	} else {
+		env.GlobalGetEnv = rawConfig.GetEnv
+	}
+
 	// build the root cmd
 	rootCmd := NewRootCmd(f)
+	rootCmd.SetHelpCommand(&cobra.Command{
+		Use:    "no-help",
+		Hidden: true,
+	})
 	persistentFlags := rootCmd.PersistentFlags()
 	globalFlags = flags.SetGlobalFlags(persistentFlags)
+
+	rootCmd.SetUsageTemplate(`Usage:{{if .Runnable}}
+  {{.UseLine}}{{end}}{{if .HasAvailableSubCommands}}
+  {{.CommandPath}} [command]{{end}}{{if gt (len .Aliases) 0}}
+  
+Aliases:
+  {{.NameAndAliases}}{{end}}{{if .HasExample}}
+  
+Examples:
+{{.Example}}{{end}}{{if .HasAvailableSubCommands}}
+  
+Available Commands:{{range .Commands}}{{if (or .IsAvailableCommand (eq .Name "help"))}}
+  {{rpad .Name .NamePadding }} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableLocalFlags}}
+  
+Flags:
+{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasAvailableInheritedFlags}}
+  
+Global Flags:
+{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasHelpSubCommands}}
+
+Additional help topics:{{range .Commands}}{{if .IsAdditionalHelpTopicCommand}}
+  {{rpad .CommandPath .CommandPathPadding}} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableSubCommands}}
+
+{{- if not (eq .Name "run")}}
+
+Use "{{.CommandPath}} [command] --help" for more information about a command.
+{{- end -}}
+
+{{- if (and .HasAvailableSubCommands) -}}
+{{- range .Commands -}}
+{{- if (and .HasSubCommands (eq .Name "run"))}}
+
+Additional run commands:
+{{- range .Commands}}
+  {{rpad (printf "'%s'" .CommandPath) .CommandPathPadding}} {{.Short}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{end}}
+`)
 
 	// Add sub commands
 	rootCmd.AddCommand(add.NewAddCmd(f, globalFlags, plugins))
@@ -175,27 +244,30 @@ func BuildRoot(f factory.Factory, excludePlugins bool) *cobra.Command {
 	rootCmd.AddCommand(set.NewSetCmd(f, globalFlags, plugins))
 	rootCmd.AddCommand(use.NewUseCmd(f, globalFlags, plugins))
 	rootCmd.AddCommand(update.NewUpdateCmd(f, globalFlags, plugins))
-	rootCmd.AddCommand(save.NewSaveCmd(f, globalFlags, plugins))
-	rootCmd.AddCommand(restore.NewRestoreCmd(f, globalFlags, plugins))
 
 	// Add main commands
 	rootCmd.AddCommand(NewInitCmd(f))
 	rootCmd.AddCommand(NewRestartCmd(f, globalFlags))
-	rootCmd.AddCommand(NewDevCmd(f, globalFlags))
-	rootCmd.AddCommand(NewBuildCmd(f, globalFlags))
 	rootCmd.AddCommand(NewSyncCmd(f, globalFlags))
-	rootCmd.AddCommand(NewRenderCmd(f, globalFlags))
-	rootCmd.AddCommand(NewPurgeCmd(f, globalFlags))
+	rootCmd.AddCommand(NewRenderCmd(f, globalFlags, rawConfig))
 	rootCmd.AddCommand(NewUpgradeCmd())
-	rootCmd.AddCommand(NewDeployCmd(f, globalFlags))
 	rootCmd.AddCommand(NewEnterCmd(f, globalFlags))
 	rootCmd.AddCommand(NewAnalyzeCmd(f, globalFlags))
 	rootCmd.AddCommand(NewLogsCmd(f, globalFlags))
 	rootCmd.AddCommand(NewOpenCmd(f, globalFlags))
 	rootCmd.AddCommand(NewUICmd(f, globalFlags))
-	rootCmd.AddCommand(NewRunCmd(f, globalFlags))
+	rootCmd.AddCommand(NewRunCmd(f, globalFlags, rawConfig))
 	rootCmd.AddCommand(NewAttachCmd(f, globalFlags))
 	rootCmd.AddCommand(NewPrintCmd(f, globalFlags))
+	rootCmd.AddCommand(NewRunPipelineCmd(f, globalFlags, rawConfig))
+	rootCmd.AddCommand(NewCompletionCmd())
+	rootCmd.AddCommand(NewVersionCmd())
+
+	// check overwrite commands
+	rootCmd.AddCommand(NewDevCmd(f, globalFlags, rawConfig))
+	rootCmd.AddCommand(NewDeployCmd(f, globalFlags, rawConfig))
+	rootCmd.AddCommand(NewBuildCmd(f, globalFlags, rawConfig))
+	rootCmd.AddCommand(NewPurgeCmd(f, globalFlags, rawConfig))
 
 	// Add plugin commands
 	plugin.AddPluginCommands(rootCmd, plugins, "")
@@ -206,6 +278,112 @@ func BuildRoot(f factory.Factory, excludePlugins bool) *cobra.Command {
 func disableKlog() {
 	flagSet := &flag.FlagSet{}
 	klog.InitFlags(flagSet)
-	flagSet.Set("logtostderr", "false")
+	_ = flagSet.Set("logtostderr", "false")
 	klog.SetOutput(ioutil.Discard)
+
+	flagSet = &flag.FlagSet{}
+	klogv2.InitFlags(flagSet)
+	_ = flagSet.Set("logtostderr", "false")
+	klogv2.SetOutput(ioutil.Discard)
+}
+
+func parseConfig(f factory.Factory) (*RawConfig, error) {
+	// get current working dir
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+
+	// set working dir back to original
+	defer func() { _ = os.Chdir(cwd) }()
+
+	// Set config root
+	configLoader, err := f.NewConfigLoader("")
+	if err != nil {
+		return nil, err
+	}
+	configExists, err := configLoader.SetDevSpaceRoot(log.Discard)
+	if err != nil {
+		return nil, err
+	} else if !configExists {
+		return nil, errors.New(message.ConfigNotFound)
+	}
+
+	// Parse commands
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+
+	r := &RawConfig{
+		resolved: map[string]string{},
+	}
+	_, err = configLoader.LoadWithParser(timeoutCtx, nil, nil, r, &loader.ConfigOptions{Dry: true}, log.Discard)
+	if r.Resolver != nil {
+		return r, nil
+	}
+
+	return nil, err
+}
+
+type RawConfig struct {
+	Ctx               context.Context
+	OriginalRawConfig map[string]interface{}
+	RawConfig         map[string]interface{}
+	Resolver          variable.Resolver
+
+	Config *latest.Config
+
+	resolvedMutex sync.Mutex
+	resolved      map[string]string
+}
+
+func (r *RawConfig) Parse(
+	ctx context.Context,
+	originalRawConfig map[string]interface{},
+	rawConfig map[string]interface{},
+	resolver variable.Resolver,
+	log log.Logger,
+) (*latest.Config, map[string]interface{}, error) {
+	r.Ctx = ctx
+	r.OriginalRawConfig = originalRawConfig
+	r.RawConfig = rawConfig
+	r.Resolver = resolver
+
+	// try parsing commands
+	latestConfig, beforeConversion, err := loader.NewCommandsPipelinesParser().Parse(ctx, originalRawConfig, rawConfig, resolver, log)
+	r.Config = latestConfig
+	return latestConfig, beforeConversion, err
+}
+
+func (r *RawConfig) GetEnv(name string) string {
+	// try to get from environment
+	value := os.Getenv(name)
+	if value != "" {
+		return value
+	}
+
+	// try to find devspace variable
+	if r.Resolver != nil {
+		r.resolvedMutex.Lock()
+		defer r.resolvedMutex.Unlock()
+
+		// cache which ones were tried
+		value, ok := r.resolved[name]
+		if ok {
+			return value
+		}
+
+		varName := "${" + name + "}"
+		out, err := r.Resolver.FillVariables(r.Ctx, varName)
+		if err == nil {
+			value := fmt.Sprintf("%v", out)
+			if value != varName && value != "" {
+				r.resolved[name] = value
+				return value
+			}
+		}
+
+		r.resolved[name] = ""
+	}
+
+	return ""
 }

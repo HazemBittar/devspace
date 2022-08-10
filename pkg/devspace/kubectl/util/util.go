@@ -1,14 +1,15 @@
 package util
 
 import (
+	"io/ioutil"
+	"os"
+
 	"github.com/loft-sh/devspace/pkg/util/kubeconfig"
 	"github.com/pkg/errors"
-	"io/ioutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-	"os"
 )
 
 const localContext = "incluster"
@@ -26,7 +27,7 @@ func NewClientByContext(context, namespace string, switchContext bool, kubeLoade
 		// try to load in cluster config
 		config, err := rest.InClusterConfig()
 		if err != nil {
-			return nil, "", "", false, errors.Errorf("kube config is invalid: please make sure you have an existing valid kube config")
+			return nil, "", "", false, errors.Errorf("kube config is invalid")
 		}
 
 		currentNamespace, err := inClusterNamespace()

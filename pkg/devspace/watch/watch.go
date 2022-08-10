@@ -1,11 +1,12 @@
 package watch
 
 import (
-	"github.com/loft-sh/devspace/helper/server/ignoreparser"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/loft-sh/devspace/helper/server/ignoreparser"
 
 	"github.com/bmatcuk/doublestar"
 	"github.com/loft-sh/devspace/pkg/util/log"
@@ -39,7 +40,7 @@ type watcher struct {
 
 // New watches a given glob paths array for changes
 func New(paths []string, exclude []string, pollInterval time.Duration, callback Callback, log log.Logger) (Watcher, error) {
-	ignoreMatcher, err := ignoreparser.CompilePaths(exclude)
+	ignoreMatcher, err := ignoreparser.CompilePaths(exclude, log)
 	if err != nil {
 		return nil, err
 	}

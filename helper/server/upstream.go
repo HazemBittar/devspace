@@ -6,7 +6,10 @@ import (
 	"github.com/loft-sh/devspace/helper/server/ignoreparser"
 	"github.com/loft-sh/devspace/helper/util"
 	"github.com/loft-sh/devspace/helper/util/crc32"
+	"github.com/loft-sh/devspace/helper/util/pingtimeout"
 	"github.com/loft-sh/devspace/helper/util/stderrlog"
+	"github.com/loft-sh/devspace/pkg/util/fsutil"
+	logpkg "github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -16,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // UpstreamOptions holds the upstream server options
@@ -31,6 +35,7 @@ type UpstreamOptions struct {
 
 	OverridePermission bool
 	ExitOnClose        bool
+	Ping               bool
 }
 
 // StartUpstreamServer starts a new upstream server with the given reader and writer
@@ -40,18 +45,26 @@ func StartUpstreamServer(reader io.Reader, writer io.Writer, options *UpstreamOp
 	done := make(chan error)
 
 	// Compile ignore paths
-	ignoreMatcher, err := ignoreparser.CompilePaths(options.ExludePaths)
+	ignoreMatcher, err := ignoreparser.CompilePaths(options.ExludePaths, logpkg.Discard)
 	if err != nil {
 		return errors.Wrap(err, "compile paths")
 	}
 
 	go func() {
 		s := grpc.NewServer()
-
-		remote.RegisterUpstreamServer(s, &Upstream{
+		upstream := &Upstream{
 			options:       options,
 			ignoreMatcher: ignoreMatcher,
-		})
+			ping:          &pingtimeout.PingTimeout{},
+		}
+
+		if options.Ping {
+			doneChan := make(chan struct{})
+			defer close(doneChan)
+			upstream.ping.Start(doneChan)
+		}
+
+		remote.RegisterUpstreamServer(s, upstream)
 		reflection.Register(s)
 
 		done <- s.Serve(lis)
@@ -63,14 +76,22 @@ func StartUpstreamServer(reader io.Reader, writer io.Writer, options *UpstreamOp
 
 // Upstream is the implementation for the upstream server
 type Upstream struct {
+	remote.UnimplementedUpstreamServer
+
 	options *UpstreamOptions
 
 	// ignore matcher is the ignore matcher which matches against excluded files and paths
 	ignoreMatcher ignoreparser.IgnoreParser
+
+	ping *pingtimeout.PingTimeout
 }
 
 // Ping returns empty
 func (u *Upstream) Ping(context.Context, *remote.Empty) (*remote.Empty, error) {
+	if u.ping != nil {
+		u.ping.Ping()
+	}
+
 	return &remote.Empty{}, nil
 }
 
@@ -117,20 +138,55 @@ func (u *Upstream) Remove(stream remote.Upstream_RemoveServer) error {
 	}
 }
 
-func (u *Upstream) Checksums(ctx context.Context, paths *remote.Paths) (*remote.PathsChecksum, error) {
+func (u *Upstream) Checksums(ctx context.Context, paths *remote.TouchPaths) (*remote.PathsChecksum, error) {
 	if paths != nil {
+		// update timestamps & permissions
+		stopChan := make(chan struct{})
+		go func() {
+			for _, path := range paths.Paths {
+				if path.Path == "" {
+					continue
+				}
+
+				// Update timestamp if needed
+				absolutePath := filepath.Join(u.options.UploadPath, path.Path)
+				if path.MtimeUnix > 0 {
+					t := time.Unix(path.MtimeUnix, 0)
+					err := os.Chtimes(absolutePath, t, t)
+					if err != nil && !os.IsNotExist(err) {
+						stderrlog.Infof("Error touching %s: %v", path, err)
+					}
+				}
+
+				// Update permissions if needed
+				if path.Mode > 0 {
+					err := os.Chmod(absolutePath, os.FileMode(path.Mode))
+					if err != nil && !os.IsNotExist(err) {
+						stderrlog.Infof("Error chmod %s: %v", path, err)
+					}
+				}
+			}
+
+			close(stopChan)
+		}()
+
 		checksums := make([]uint32, 0, len(paths.Paths))
 		for _, path := range paths.Paths {
+			if path.Path == "" {
+				continue
+			}
+
 			// Just remove everything inside and ignore any errors
-			absolutePath := filepath.Join(u.options.UploadPath, path)
+			absolutePath := filepath.Join(u.options.UploadPath, path.Path)
 			checksum, err := crc32.Checksum(absolutePath)
-			if err != nil && os.IsNotExist(err) == false {
-				stderrlog.Logf("Error checksum %s: %v", path, err)
+			if err != nil && !os.IsNotExist(err) {
+				stderrlog.Infof("Error checksum %s: %v", path, err)
 			}
 
 			checksums = append(checksums, checksum)
 		}
 
+		<-stopChan
 		return &remote.PathsChecksum{Checksums: checksums}, nil
 	}
 
@@ -146,9 +202,12 @@ func (u *Upstream) removeRecursive(absolutePath string) error {
 	// Loop over directory contents and check if we should delete the contents
 	for _, f := range files {
 		absoluteChildPath := filepath.Join(absolutePath, f.Name())
+		if fsutil.IsRecursiveSymlink(f, absoluteChildPath) {
+			continue
+		}
 
 		// Check if ignored
-		if u.ignoreMatcher != nil && u.ignoreMatcher.RequireFullScan() == false && u.ignoreMatcher.Matches(absolutePath[len(u.options.UploadPath):], f.IsDir()) {
+		if u.ignoreMatcher != nil && !u.ignoreMatcher.RequireFullScan() && u.ignoreMatcher.Matches(absolutePath[len(u.options.UploadPath):], f.IsDir()) {
 			continue
 		}
 
@@ -158,14 +217,14 @@ func (u *Upstream) removeRecursive(absolutePath string) error {
 			_ = u.removeRecursive(absoluteChildPath)
 		} else {
 			// Check if not ignored
-			if u.ignoreMatcher == nil || u.ignoreMatcher.RequireFullScan() == false || u.ignoreMatcher.Matches(absolutePath[len(u.options.UploadPath):], false) == false {
+			if u.ignoreMatcher == nil || !u.ignoreMatcher.RequireFullScan() || !u.ignoreMatcher.Matches(absolutePath[len(u.options.UploadPath):], false) {
 				_ = os.Remove(absoluteChildPath)
 			}
 		}
 	}
 
 	// Check if not ignored
-	if u.ignoreMatcher == nil || u.ignoreMatcher.RequireFullScan() == false || u.ignoreMatcher.Matches(absolutePath[len(u.options.UploadPath):], true) == false {
+	if u.ignoreMatcher == nil || !u.ignoreMatcher.RequireFullScan() || !u.ignoreMatcher.Matches(absolutePath[len(u.options.UploadPath):], true) {
 		// This will not remove the directory if there is still a file or directory in it
 		return os.Remove(absolutePath)
 	}

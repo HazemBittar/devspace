@@ -13,7 +13,6 @@ export GOFLAGS=-mod=vendor
 # go mod vendor
 
 DEVSPACE_ROOT=$(git rev-parse --show-toplevel)
-VERSION=$(git describe --tags $(git rev-list --tags --max-count=1))
 COMMIT_HASH=$(git rev-parse --short HEAD 2>/dev/null)
 DATE=$(date "+%Y-%m-%d")
 BUILD_PLATFORM=$(uname -a | awk '{print tolower($1);}')
@@ -29,7 +28,7 @@ if [[ "$(pwd)" != "${DEVSPACE_ROOT}" ]]; then
 fi
 
 GO_BUILD_CMD="go build -a"
-GO_BUILD_LDFLAGS="-s -w -X main.commitHash=${COMMIT_HASH} -X main.buildDate=${DATE} -X main.version=${VERSION} -X github.com/loft-sh/devspace/pkg/devspace/config/generated.EncryptionKey=$ENCRYPTION_KEY"
+GO_BUILD_LDFLAGS="-s -w -X main.commitHash=${COMMIT_HASH} -X main.buildDate=${DATE} -X main.version=${VERSION} -X github.com/loft-sh/devspace/pkg/devspace/config/localcache.EncryptionKey=$ENCRYPTION_KEY"
 
 if [[ -z "${DEVSPACE_BUILD_PLATFORMS}" ]]; then
     DEVSPACE_BUILD_PLATFORMS="linux windows darwin"
@@ -58,9 +57,11 @@ shasum -a 256 "${DEVSPACE_ROOT}/release/ui.tar.gz" > "${DEVSPACE_ROOT}/release/u
 # build devspace helper
 echo "Building devspace helper"
 GOARCH=amd64 GOOS=linux go build -ldflags "-s -w -X github.com/loft-sh/devspace/helper/cmd.version=${VERSION}" -o "${DEVSPACE_ROOT}/release/devspacehelper" helper/main.go
+upx "${DEVSPACE_ROOT}/release/devspacehelper" #compress devspacehelper
 shasum -a 256 "${DEVSPACE_ROOT}/release/devspacehelper" > "${DEVSPACE_ROOT}/release/devspacehelper".sha256
 
 GOARCH=arm64 GOOS=linux go build -ldflags "-s -w -X github.com/loft-sh/devspace/helper/cmd.version=${VERSION}" -o "${DEVSPACE_ROOT}/release/devspacehelper-arm64" helper/main.go
+upx "${DEVSPACE_ROOT}/release/devspacehelper-arm64" #compress devspacehelper
 shasum -a 256 "${DEVSPACE_ROOT}/release/devspacehelper-arm64" > "${DEVSPACE_ROOT}/release/devspacehelper-arm64".sha256
 
 # build bin data
@@ -84,10 +85,19 @@ for OS in ${DEVSPACE_BUILD_PLATFORMS[@]}; do
         echo "Building for ${OS}/${ARCH} not supported."
         continue
     fi
-
+    
     echo "Building for ${OS}/${ARCH}"
-    GOARCH=${ARCH} GOOS=${OS} ${GO_BUILD_CMD} -ldflags "${GO_BUILD_LDFLAGS}"\
-      -o "${DEVSPACE_ROOT}/release/${NAME}" .
+    
+    # build darwin with CGO_ENABLED=1
+    if [[ "${OS}" == "darwin" ]]; then
+      CGO_ENABLED=1
+    else
+      CGO_ENABLED=0 
+    fi
+    
+    # build the DevSpace binary
+    CGO_ENABLED=${CGO_ENABLED} GOARCH=${ARCH} GOOS=${OS} ${GO_BUILD_CMD} -ldflags "${GO_BUILD_LDFLAGS}"\
+                  -o "${DEVSPACE_ROOT}/release/${NAME}" .
     shasum -a 256 "${DEVSPACE_ROOT}/release/${NAME}" > "${DEVSPACE_ROOT}/release/${NAME}".sha256
   done
 done

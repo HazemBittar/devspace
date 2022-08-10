@@ -1,9 +1,10 @@
 package cmd
 
 import (
+	"os"
+
 	"github.com/loft-sh/devspace/helper/tunnel"
 	"github.com/spf13/cobra"
-	"os"
 )
 
 // TunnelCmd holds the tunnel cmd flags
@@ -24,5 +25,5 @@ func NewTunnelCmd() *cobra.Command {
 
 // Run runs the command logic
 func (cmd *TunnelCmd) Run(cobraCmd *cobra.Command, args []string) error {
-	return tunnel.StartTunnelServer(os.Stdin, os.Stdout, true)
+	return tunnel.StartTunnelServer(os.Stdin, os.Stdout, true, true)
 }

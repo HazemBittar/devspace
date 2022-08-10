@@ -2,47 +2,62 @@ package selector
 
 import (
 	"context"
-	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
-	"github.com/loft-sh/devspace/pkg/util/hash"
-	"github.com/loft-sh/devspace/pkg/util/imageselector"
-	"github.com/pkg/errors"
-	k8sv1 "k8s.io/api/core/v1"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sort"
 	"strings"
+
+	"github.com/loft-sh/devspace/pkg/devspace/imageselector"
+
+	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
+	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
 	MatchedContainerAnnotation = "devspace.sh/container"
-	ImageSelectorLabel         = "devspace.sh/imageSelector"
+	ImageSelectorAnnotation    = "devspace.sh/imageSelector"
 
 	ReplacedLabel = "devspace.sh/replaced"
 )
 
-var SortPodsByNewest = func(pods []*k8sv1.Pod, i, j int) bool {
+var SortPodsByNewest = func(pods []*corev1.Pod, i, j int) bool {
 	return pods[i].CreationTimestamp.Unix() > pods[j].CreationTimestamp.Unix()
 }
 
 var SortContainersByNewest = func(pods []*SelectedPodContainer, i, j int) bool {
+	if pods[i].Pod.Name == pods[j].Pod.Name {
+		// this is needed for containers with the same image where we want to say that normal containers take prio over init containers
+		return initContainerPos(pods[i].Container.Name, pods[i].Pod) < initContainerPos(pods[j].Container.Name, pods[j].Pod)
+	}
+
 	return pods[i].Pod.CreationTimestamp.Unix() > pods[j].Pod.CreationTimestamp.Unix()
 }
 
-var FilterNonRunningPods = func(p *k8sv1.Pod) bool {
-	return kubectl.GetPodStatus(p) != "Running"
+func initContainerPos(container string, pod *corev1.Pod) int {
+	for i, c := range pod.Spec.InitContainers {
+		if c.Name == container {
+			return i
+		}
+	}
+	return -1
 }
 
-var FilterNonRunningContainers = func(p *k8sv1.Pod, c *k8sv1.Container) bool {
-	if p.DeletionTimestamp != nil {
+var FilterTerminatingContainers = func(p *corev1.Pod, c *corev1.Container) bool {
+	return IsPodTerminating(p)
+}
+
+var FilterNonRunningContainers = func(p *corev1.Pod, c *corev1.Container) bool {
+	if IsPodTerminating(p) {
 		return true
 	}
 	for _, cs := range p.Status.InitContainerStatuses {
-		if cs.Name == c.Name && cs.State.Running != nil {
+		if cs.Name == c.Name && cs.Ready && cs.State.Running != nil {
 			return false
 		}
 	}
 	for _, cs := range p.Status.ContainerStatuses {
-		if cs.Name == c.Name && cs.State.Running != nil {
+		if cs.Name == c.Name && cs.Ready && cs.State.Running != nil {
 			return false
 		}
 	}
@@ -50,20 +65,19 @@ var FilterNonRunningContainers = func(p *k8sv1.Pod, c *k8sv1.Container) bool {
 }
 
 type SelectedPodContainer struct {
-	Pod       *k8sv1.Pod
-	Container *k8sv1.Container
+	Pod       *corev1.Pod
+	Container *corev1.Container
 }
 
 type Selector struct {
-	ImageSelector      []imageselector.ImageSelector
-	LabelSelector      string
-	Pod                string
-	ContainerName      string
-	Namespace          string
-	SkipInitContainers bool
+	ImageSelector      []string `json:"imageSelector"`
+	LabelSelector      string   `json:"labelSelector"`
+	Pod                string   `json:"pod"`
+	ContainerName      string   `json:"containerName"`
+	Namespace          string   `json:"namespace"`
+	SkipInitContainers bool     `json:"skipInitContainers"`
 
-	FilterPod       FilterPod
-	FilterContainer FilterContainer
+	FilterContainer FilterContainer `json:"-"`
 }
 
 func (s Selector) String() string {
@@ -73,15 +87,14 @@ func (s Selector) String() string {
 
 	strs := []string{}
 	if len(s.ImageSelector) > 0 {
-		sa := []string{}
-		for _, c := range s.ImageSelector {
-			sa = append(sa, c.Image)
-		}
-
-		strs = append(strs, "image selector: "+strings.Join(sa, ","))
+		strs = append(strs, "image selector: "+strings.Join(s.ImageSelector, ","))
 	}
 	if len(s.LabelSelector) > 0 {
-		strs = append(strs, "label selector: "+s.LabelSelector)
+		if s.ContainerName != "" {
+			strs = append(strs, "label selector: "+s.LabelSelector+" - container: "+s.ContainerName)
+		} else {
+			strs = append(strs, "label selector: "+s.LabelSelector)
+		}
 	}
 	if s.Pod != "" {
 		strs = append(strs, "pod name: "+s.Pod)
@@ -90,21 +103,16 @@ func (s Selector) String() string {
 	return strings.Join(strs, ", ")
 }
 
-type FilterPod func(p *k8sv1.Pod) bool
-type FilterContainer func(p *k8sv1.Pod, c *k8sv1.Container) bool
-
-type SortPods func(pods []*k8sv1.Pod, i, j int) bool
+type FilterContainer func(p *corev1.Pod, c *corev1.Container) bool
 type SortContainers func(containers []*SelectedPodContainer, i, j int) bool
 
 type Filter interface {
 	SelectContainers(ctx context.Context, selectors ...Selector) ([]*SelectedPodContainer, error)
-	SelectPods(ctx context.Context, selectors ...Selector) ([]*k8sv1.Pod, error)
 }
 
 type filter struct {
 	client kubectl.Client
 
-	sortPods       SortPods
 	sortContainers SortContainers
 }
 
@@ -114,28 +122,11 @@ func NewFilter(client kubectl.Client) Filter {
 	}
 }
 
-func NewFilterWithSort(client kubectl.Client, sortPods SortPods, sortContainers SortContainers) Filter {
+func NewFilterWithSort(client kubectl.Client, sortContainers SortContainers) Filter {
 	return &filter{
 		client:         client,
-		sortPods:       sortPods,
 		sortContainers: sortContainers,
 	}
-}
-
-func (f *filter) SelectPods(ctx context.Context, selectors ...Selector) ([]*k8sv1.Pod, error) {
-	retList, err := f.SelectContainers(ctx, selectors...)
-	if err != nil {
-		return nil, err
-	}
-
-	pods := podsFromPodContainer(retList)
-	if f.sortPods != nil {
-		sort.Slice(pods, func(i, j int) bool {
-			return f.sortPods(pods, i, j)
-		})
-	}
-
-	return pods, nil
 }
 
 func (f *filter) SelectContainers(ctx context.Context, selectors ...Selector) ([]*SelectedPodContainer, error) {
@@ -147,7 +138,7 @@ func (f *filter) SelectContainers(ctx context.Context, selectors ...Selector) ([
 		}
 
 		if s.LabelSelector != "" || (len(s.ImageSelector) == 0 && s.Pod == "") {
-			containersByLabelSelector, err := byLabelSelector(ctx, f.client, namespace, s.LabelSelector, s.ContainerName, s.FilterPod, s.FilterContainer, s.SkipInitContainers)
+			containersByLabelSelector, err := byLabelSelector(ctx, f.client, namespace, s.LabelSelector, s.ContainerName, s.FilterContainer, s.SkipInitContainers)
 			if err != nil {
 				return nil, errors.Wrap(err, "pods by label selector")
 			}
@@ -155,12 +146,12 @@ func (f *filter) SelectContainers(ctx context.Context, selectors ...Selector) ([
 			retList = append(retList, containersByLabelSelector...)
 		}
 
-		containersByImage, err := byImageName(ctx, f.client, namespace, s.ImageSelector, s.FilterPod, s.FilterContainer, s.SkipInitContainers)
+		containersByImage, err := byImageName(ctx, f.client, namespace, s.ImageSelector, s.ContainerName, s.FilterContainer, s.SkipInitContainers)
 		if err != nil {
 			return nil, errors.Wrap(err, "pods by image name")
 		}
 
-		containersByName, err := byPodName(ctx, f.client, namespace, s.Pod, s.ContainerName, s.FilterPod, s.FilterContainer, s.SkipInitContainers)
+		containersByName, err := byPodName(ctx, f.client, namespace, s.Pod, s.ContainerName, s.FilterContainer, s.SkipInitContainers)
 		if err != nil {
 			return nil, errors.Wrap(err, "pods by label selector")
 		}
@@ -189,17 +180,21 @@ func deduplicate(stack []*SelectedPodContainer) []*SelectedPodContainer {
 	return retStack
 }
 
-func podsFromPodContainer(stack []*SelectedPodContainer) []*k8sv1.Pod {
-	retPods := []*k8sv1.Pod{}
+func PodsFromPodContainer(stack []*SelectedPodContainer) []*corev1.Pod {
+	retPods := []*corev1.Pod{}
 	for _, s := range stack {
 		if !containsPod(retPods, key(s.Pod.Namespace, s.Pod.Name, "")) {
 			retPods = append(retPods, s.Pod)
 		}
 	}
+
+	sort.Slice(retPods, func(i, j int) bool {
+		return SortPodsByNewest(retPods, i, j)
+	})
 	return retPods
 }
 
-func containsPod(stack []*k8sv1.Pod, k string) bool {
+func containsPod(stack []*corev1.Pod, k string) bool {
 	for _, s := range stack {
 		if key(s.Namespace, s.Name, "") == k {
 			return true
@@ -221,7 +216,7 @@ func key(namespace string, pod string, container string) string {
 	return namespace + "/" + pod + "/" + container
 }
 
-func byPodName(ctx context.Context, client kubectl.Client, namespace string, name string, containerName string, skipPod FilterPod, skipContainer FilterContainer, skipInit bool) ([]*SelectedPodContainer, error) {
+func byPodName(ctx context.Context, client kubectl.Client, namespace string, name string, containerName string, skipContainer FilterContainer, skipInit bool) ([]*SelectedPodContainer, error) {
 	if name == "" {
 		return nil, nil
 	}
@@ -234,11 +229,6 @@ func byPodName(ctx context.Context, client kubectl.Client, namespace string, nam
 		}
 
 		return nil, errors.Wrap(err, "get pod")
-	}
-	if skipPod != nil && skipPod(pod) {
-		return nil, nil
-	} else if pod.DeletionTimestamp != nil {
-		return nil, nil
 	}
 
 	if !skipInit {
@@ -275,7 +265,7 @@ func byPodName(ctx context.Context, client kubectl.Client, namespace string, nam
 	return retPods, nil
 }
 
-func byLabelSelector(ctx context.Context, client kubectl.Client, namespace string, labelSelector string, containerName string, skipPod FilterPod, skipContainer FilterContainer, skipInit bool) ([]*SelectedPodContainer, error) {
+func byLabelSelector(ctx context.Context, client kubectl.Client, namespace string, labelSelector string, containerName string, skipContainer FilterContainer, skipInit bool) ([]*SelectedPodContainer, error) {
 	retPods := []*SelectedPodContainer{}
 	podList, err := client.KubeClient().CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
 	if err != nil {
@@ -283,12 +273,6 @@ func byLabelSelector(ctx context.Context, client kubectl.Client, namespace strin
 	}
 
 	for _, pod := range podList.Items {
-		if skipPod != nil && skipPod(&pod) {
-			continue
-		} else if pod.DeletionTimestamp != nil {
-			continue
-		}
-
 		if !skipInit {
 			for _, container := range pod.Spec.InitContainers {
 				if skipContainer != nil && skipContainer(&pod, &container) {
@@ -325,7 +309,7 @@ func byLabelSelector(ctx context.Context, client kubectl.Client, namespace strin
 	return retPods, nil
 }
 
-func byImageName(ctx context.Context, client kubectl.Client, namespace string, imageSelector []imageselector.ImageSelector, skipPod FilterPod, skipContainer FilterContainer, skipInit bool) ([]*SelectedPodContainer, error) {
+func byImageName(ctx context.Context, client kubectl.Client, namespace string, imageSelector []string, containerName string, skipContainer FilterContainer, skipInit bool) ([]*SelectedPodContainer, error) {
 	retPods := []*SelectedPodContainer{}
 	if len(imageSelector) > 0 {
 		podList, err := client.KubeClient().CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
@@ -334,16 +318,13 @@ func byImageName(ctx context.Context, client kubectl.Client, namespace string, i
 		}
 
 		for _, pod := range podList.Items {
-			if skipPod != nil && skipPod(&pod) {
-				continue
-			} else if pod.DeletionTimestamp != nil {
-				continue
-			}
-
 			if !skipInit {
 				for _, container := range pod.Spec.InitContainers {
 					for _, imageName := range imageSelector {
 						if skipContainer != nil && skipContainer(&pod, &container) {
+							continue
+						}
+						if containerName != "" && container.Name != containerName {
 							continue
 						}
 
@@ -363,10 +344,20 @@ func byImageName(ctx context.Context, client kubectl.Client, namespace string, i
 					if skipContainer != nil && skipContainer(&pod, &container) {
 						continue
 					}
+					if containerName != "" && container.Name != containerName {
+						continue
+					}
 
 					// check if it is a replaced pod and if yes, check if the imageName and container name matches
-					if pod.Labels != nil && pod.Labels[ReplacedLabel] == "true" && pod.Annotations != nil && pod.Annotations[MatchedContainerAnnotation] == container.Name {
-						if pod.Labels[ImageSelectorLabel] != "" && pod.Labels[ImageSelectorLabel] == hash.String(imageName.Image)[:32] {
+					containers := map[string]bool{}
+					if pod.Annotations != nil && pod.Annotations[MatchedContainerAnnotation] != "" {
+						splitted := strings.Split(pod.Annotations[MatchedContainerAnnotation], ";")
+						for _, s := range splitted {
+							containers[s] = true
+						}
+					}
+					if pod.Labels != nil && pod.Labels[ReplacedLabel] == "true" && containers[container.Name] {
+						if pod.Annotations != nil && pod.Annotations[ImageSelectorAnnotation] != "" && pod.Annotations[ImageSelectorAnnotation] == imageName {
 							retPod := pod
 							retContainer := container
 							retPods = append(retPods, &SelectedPodContainer{
@@ -390,4 +381,8 @@ func byImageName(ctx context.Context, client kubectl.Client, namespace string, i
 		}
 	}
 	return retPods, nil
+}
+
+func IsPodTerminating(pod *corev1.Pod) bool {
+	return pod.DeletionTimestamp != nil || strings.Contains(pod.Status.Reason, "Evicted")
 }

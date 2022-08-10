@@ -7,7 +7,7 @@ import (
 	next "github.com/loft-sh/devspace/pkg/devspace/config/versions/v1beta3"
 	"github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/loft-sh/devspace/pkg/util/ptr"
-	yaml "gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v3"
 )
 
 type testCase struct {
@@ -107,7 +107,7 @@ func TestSimple(t *testing.T) {
 					},
 				},
 				Images: &map[string]*ImageConfig{
-					"default": &ImageConfig{},
+					"default": {},
 				},
 			},
 			expected: &next.Config{
@@ -143,7 +143,7 @@ func TestSimple(t *testing.T) {
 					},
 				},
 				Images: map[string]*next.ImageConfig{
-					"default": &next.ImageConfig{
+					"default": {
 						CreatePullSecret: ptr.Bool(false),
 					},
 				},

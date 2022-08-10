@@ -1,7 +1,6 @@
 package hash
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -24,10 +23,7 @@ func TestHashString(t *testing.T) {
 }
 
 func TestHashDirectory(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test")
-	if err != nil {
-		t.Fatalf("Error creating temporary directory: %v", err)
-	}
+	dir := t.TempDir()
 
 	wdBackup, err := os.Getwd()
 	if err != nil {
@@ -43,10 +39,6 @@ func TestHashDirectory(t *testing.T) {
 		err = os.Chdir(wdBackup)
 		if err != nil {
 			t.Fatalf("Error changing dir back: %v", err)
-		}
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Fatalf("Error removing dir: %v", err)
 		}
 	}()
 
@@ -57,7 +49,7 @@ func TestHashDirectory(t *testing.T) {
 	}
 
 	//Use on file
-	fsutil.WriteToFile([]byte(""), "someFile")
+	_ = fsutil.WriteToFile([]byte(""), "someFile")
 	_, err = Directory("someFile")
 	if err != nil {
 		t.Fatalf("Error creating hash of file: %v", err)
@@ -66,10 +58,7 @@ func TestHashDirectory(t *testing.T) {
 }
 
 func TestHashDirectoryExcludes(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test")
-	if err != nil {
-		t.Fatalf("Error creating temporary directory: %v", err)
-	}
+	dir := t.TempDir()
 
 	wdBackup, err := os.Getwd()
 	if err != nil {
@@ -86,15 +75,11 @@ func TestHashDirectoryExcludes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Error changing dir back: %v", err)
 		}
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Fatalf("Error removing dir: %v", err)
-		}
 	}()
 
-	fsutil.WriteToFile([]byte(""), "inludedFile")
-	fsutil.WriteToFile([]byte(""), "excludedFile")
-	fsutil.WriteToFile([]byte(""), "excludedDir/someFile")
+	_ = fsutil.WriteToFile([]byte(""), "inludedFile")
+	_ = fsutil.WriteToFile([]byte(""), "excludedFile")
+	_ = fsutil.WriteToFile([]byte(""), "excludedDir/someFile")
 	_, err = DirectoryExcludes(".", []string{"excludedFile", "excludedDir"}, false)
 	if err != nil {
 		t.Fatalf("Error creating hash of directory: %v", err)

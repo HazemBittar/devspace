@@ -2,9 +2,12 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+
+	"github.com/loft-sh/devspace/helper/cmd/proxycommands"
+
 	"github.com/loft-sh/devspace/helper/cmd/sync"
 	"github.com/spf13/cobra"
-	"os"
 )
 
 // NewRootCmd returns a new root command
@@ -24,7 +27,7 @@ func Execute() {
 	// execute command
 	err := rootCmd.Execute()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v", err)
+		_, _ = fmt.Fprintf(os.Stderr, "%v", err)
 		os.Exit(1)
 	}
 }
@@ -36,7 +39,8 @@ func BuildRoot() *cobra.Command {
 	rootCmd.AddCommand(NewRestartCmd())
 	rootCmd.AddCommand(NewVersionCmd())
 	rootCmd.AddCommand(NewTunnelCmd())
+	rootCmd.AddCommand(NewSSHCmd())
 	rootCmd.AddCommand(sync.NewSyncCmd())
-
+	rootCmd.AddCommand(proxycommands.NewProxyCommands())
 	return rootCmd
 }

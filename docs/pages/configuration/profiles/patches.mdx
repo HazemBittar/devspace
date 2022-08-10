@@ -3,7 +3,7 @@ title: "Profiles: Patches"
 sidebar_label: patches
 ---
 
-import FragmentInfoPrintConfig from '../../fragments/tip-print-config.mdx';
+import FragmentInfoPrintConfig from '../../_partials/tip-print-config.mdx';
 
 Patches are a way to perform minor overrides to the configuration without having to create a separate config file. Patch functionality follows JSON Patch([RFC](https://tools.ietf.org/html/rfc6902)) semantics, as well as enhanced `path` selectors, as implemented by the [yaml-jsonpath](https://github.com/vmware-labs/yaml-jsonpath) library.
 
@@ -16,13 +16,12 @@ images:
   backend-debugger:
     image: john/debugger
 deployments:
-- name: backend
-  helm:
-    componentChart: true
-    values:
-      containers:
-      - image: john/devbackend
-      - image: john/debugger
+  backend:
+    helm:
+      values:
+        containers:
+        - image: john/devbackend
+        - image: john/debugger
 profiles:
 - name: production
   patches:
@@ -30,10 +29,10 @@ profiles:
     path: images.backend.image
     value: john/prodbackend
   - op: replace
-    path: deployments.name=backend.helm.values.containers[0].image
+    path: deployments.backend.helm.values.containers[0].image
     value: john/prodbackend
   - op: replace
-    path: deployments.name=backend.helm.values.containers[1].image
+    path: deployments.backend.helm.values.containers[1].image
     value: john/cache
 ```
 **Explanation:**  
@@ -49,13 +48,12 @@ images:
   backend-debugger:
     image: john/debugger
 deployments:
-- name: backend
-  helm:
-    componentChart: true
-    values:
-      containers:
-      - image: john/prodbackend
-      - image: john/cache
+  backend:
+    helm:
+      values:
+        containers:
+        - image: john/prodbackend
+        - image: john/cache
 ```
 
 ## Configuration
@@ -79,7 +77,7 @@ When you want to define a `path` that contains an array (e.g. `deployments`), yo
 1. Use the index of the array item you want to patch, e.g. `deployments[0]`, `deployments/0`
 2. Use a property selector matching the array item(s) you want to patch, e.g. `deployments.name=backend`
 3. Use a wildcard selector to match all array item(s), e.g. `deployments.*`,`deployments[*]` or `deployments/*`
-4. Use a comparison selector matching the array item(s) you want to patch, e.g. `deployments[?(@.helm.timeout > 1000)]`
+4. Use a comparison selector matching the array item(s) you want to patch, e.g. `deployments[?(@.helm.timeout=='1000s')]`
 5. Use a regular expression selector matching the array item(s) you want to patch, e.g. `deployments[?(@.name=~/^production/)]`
 
 Using a selector rather than the array index is often better because it is more resilient and will not cause any issues even if the order of an array's items is changed later on. A selector is also able to select multiple array items if all of them have the same value for this property.
@@ -105,13 +103,12 @@ images:
   backend-debugger:
     image: john/debugger
 deployments:
-- name: backend
-  helm:
-    componentChart: true
-    values:
-      containers:
-      - image: john/devbackend
-      - image: john/debugger
+  backend:
+    helm:
+      values:
+        containers:
+        - image: john/devbackend
+        - image: john/debugger
 profiles:
 - name: staging
   patches:
@@ -119,20 +116,20 @@ profiles:
     path: images.backend.image
     value: john/stagingbackend
   - op: replace
-    path: deployments.name=backend.helm.values.containers.image=john/devbackend.image
+    path: deployments.backend.helm.values.containers.image=john/devbackend.image
     value: john/stagingbackend
   - op: remove
-    path: deployments.name=backend.helm.values.containers.image=john/debugger
+    path: deployments.backend.helm.values.containers.image=john/debugger
 - name: production
   patches:
   - op: replace
     path: images.backend.image
     value: john/prodbackend
   - op: replace
-    path: deployments.name=backend.helm.values.containers.image=john/devbackend.image
+    path: deployments.backend.helm.values.containers.image=john/devbackend.image
     value: john/prodbackend
   - op: replace
-    path: deployments.name=backend.helm.values.containers.image=john/debugger.image
+    path: deployments.backend.helm.values.containers.image=john/debugger.image
     value: john/cache
 ```
 **Explanation:**  
@@ -150,13 +147,12 @@ images:
   backend-debugger:
     image: john/debugger
 deployments:
-- name: backend
-  helm:
-    componentChart: true
-    values:
-      containers:
-      - image: john/devbackend
-      - image: john/debugger
+  backend:
+    helm:
+      values:
+        containers:
+        - image: john/devbackend
+        - image: john/debugger
 profiles:
 - name: staging
   patches:

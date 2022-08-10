@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash/crc32"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -51,10 +52,10 @@ func Directory(path string) (string, error) {
 	}
 
 	// Hash file
-	if fileInfo.IsDir() == false {
+	if !fileInfo.IsDir() {
 		size := strconv.FormatInt(fileInfo.Size(), 10)
 		mTime := strconv.FormatInt(fileInfo.ModTime().UnixNano(), 10)
-		io.WriteString(hash, path+";"+size+";"+mTime)
+		_, _ = io.WriteString(hash, path+";"+size+";"+mTime)
 
 		return fmt.Sprintf("%x", hash.Sum(nil)), nil
 	}
@@ -68,7 +69,7 @@ func Directory(path string) (string, error) {
 
 		size := strconv.FormatInt(info.Size(), 10)
 		mTime := strconv.FormatInt(info.ModTime().UnixNano(), 10)
-		io.WriteString(hash, path+";"+size+";"+mTime)
+		_, _ = io.WriteString(hash, path+";"+size+";"+mTime)
 
 		return nil
 	})
@@ -182,10 +183,10 @@ func DirectoryExcludes(srcPath string, excludePatterns []string, fast bool) (str
 		seen[relFilePath] = true
 		if f.IsDir() {
 			// Path is enough
-			io.WriteString(hash, filePath)
+			_, _ = io.WriteString(hash, filePath)
 		} else {
 			if fast {
-				io.WriteString(hash, filePath+";"+strconv.FormatInt(f.Size(), 10)+";"+strconv.FormatInt(f.ModTime().Unix(), 10))
+				_, _ = io.WriteString(hash, filePath+";"+strconv.FormatInt(f.Size(), 10)+";"+strconv.FormatInt(f.ModTime().Unix(), 10))
 			} else {
 				// Check file change
 				checksum, err := hashFileCRC32(filePath, 0xedb88320)
@@ -193,7 +194,7 @@ func DirectoryExcludes(srcPath string, excludePatterns []string, fast bool) (str
 					return nil
 				}
 
-				io.WriteString(hash, filePath+";"+checksum)
+				_, _ = io.WriteString(hash, filePath+";"+checksum)
 			}
 		}
 
@@ -207,10 +208,17 @@ func DirectoryExcludes(srcPath string, excludePatterns []string, fast bool) (str
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
+// StringToNumber hashes a given string to a number
+func StringToNumber(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
+}
+
 // String hashes a given string
 func String(s string) string {
 	hash := sha256.New()
-	io.WriteString(hash, s)
+	_, _ = io.WriteString(hash, s)
 
 	return fmt.Sprintf("%x", hash.Sum(nil))
 }

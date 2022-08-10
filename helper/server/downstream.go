@@ -4,9 +4,9 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
-	"github.com/loft-sh/devspace/helper/server/ignoreparser"
-	"github.com/loft-sh/devspace/helper/util/stderrlog"
-	"github.com/loft-sh/notify"
+	"github.com/loft-sh/devspace/helper/util/pingtimeout"
+	"github.com/loft-sh/devspace/pkg/util/fsutil"
+	logpkg "github.com/loft-sh/devspace/pkg/util/log"
 	"io"
 	"io/ioutil"
 	"log"
@@ -15,6 +15,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/loft-sh/devspace/helper/server/ignoreparser"
+	"github.com/loft-sh/devspace/helper/util/stderrlog"
+	"github.com/loft-sh/notify"
 
 	"github.com/loft-sh/devspace/helper/remote"
 	"github.com/loft-sh/devspace/helper/util"
@@ -33,6 +37,7 @@ type DownstreamOptions struct {
 	Throttle     int64
 
 	Polling bool
+	Ping    bool
 }
 
 // StartDownstreamServer starts a new downstream server with the given reader and writer
@@ -42,7 +47,7 @@ func StartDownstreamServer(reader io.Reader, writer io.Writer, options *Downstre
 	done := make(chan error)
 
 	// Compile ignore paths
-	ignoreMatcher, err := ignoreparser.CompilePaths(options.ExcludePaths)
+	ignoreMatcher, err := ignoreparser.CompilePaths(options.ExcludePaths, logpkg.Discard)
 	if err != nil {
 		return errors.Wrap(err, "compile paths")
 	}
@@ -54,6 +59,13 @@ func StartDownstreamServer(reader io.Reader, writer io.Writer, options *Downstre
 			ignoreMatcher: ignoreMatcher,
 			events:        make(chan notify.EventInfo, 1000),
 			changes:       map[string]bool{},
+			ping:          &pingtimeout.PingTimeout{},
+		}
+
+		if options.Ping {
+			doneChan := make(chan struct{})
+			defer close(doneChan)
+			downStream.ping.Start(doneChan)
 		}
 
 		remote.RegisterDownstreamServer(s, downStream)
@@ -61,8 +73,8 @@ func StartDownstreamServer(reader io.Reader, writer io.Writer, options *Downstre
 
 		// start watcher if this we should use it
 		watchStop := make(chan struct{})
-		if options.Polling == false {
-			stderrlog.Logf("Use inotify as watching method in container")
+		if !options.Polling {
+			stderrlog.Infof("Use inotify as watching method in container")
 
 			go func() {
 				// set up a watchpoint listening for events within a directory tree rooted at specified directory
@@ -88,7 +100,7 @@ func StartDownstreamServer(reader io.Reader, writer io.Writer, options *Downstre
 				downStream.watch(watchStop)
 			}()
 		} else {
-			stderrlog.Logf("Use polling as watching method in container")
+			stderrlog.Infof("Use polling as watching method in container")
 		}
 
 		done <- s.Serve(lis)
@@ -101,6 +113,8 @@ func StartDownstreamServer(reader io.Reader, writer io.Writer, options *Downstre
 
 // Downstream is the implementation for the downstream server
 type Downstream struct {
+	remote.UnimplementedDownstreamServer
+
 	options *DownstreamOptions
 
 	// ignore matcher is the ignore matcher which matches against excluded files and paths
@@ -120,6 +134,9 @@ type Downstream struct {
 
 	// lastRescan is used to rescan the complete path from time to time
 	lastRescan *time.Time
+
+	// ping is used to determine if we still have an alive connection
+	ping *pingtimeout.PingTimeout
 }
 
 // Download sends the file at the temp download location to the client
@@ -128,9 +145,7 @@ func (d *Downstream) Download(stream remote.Downstream_DownloadServer) error {
 	for {
 		paths, err := stream.Recv()
 		if paths != nil {
-			for _, path := range paths.Paths {
-				filesToCompress = append(filesToCompress, path)
-			}
+			filesToCompress = append(filesToCompress, paths.Paths...)
 		}
 
 		if err == io.EOF {
@@ -187,7 +202,7 @@ func (d *Downstream) compress(writer io.WriteCloser, files []string) error {
 
 	writtenFiles := make(map[string]bool)
 	for _, path := range files {
-		if _, ok := writtenFiles[path]; ok == false {
+		if _, ok := writtenFiles[path]; !ok {
 			err := recursiveTar(d.options.RemotePath, path, writtenFiles, tarWriter, true)
 			if err != nil {
 				return errors.Wrapf(err, "compress %s", path)
@@ -200,6 +215,10 @@ func (d *Downstream) compress(writer io.WriteCloser, files []string) error {
 
 // Ping returns empty
 func (d *Downstream) Ping(context.Context, *remote.Empty) (*remote.Empty, error) {
+	if d.ping != nil {
+		d.ping.Ping()
+	}
+
 	return &remote.Empty{}, nil
 }
 
@@ -283,7 +302,7 @@ func (d *Downstream) Changes(empty *remote.Empty, stream remote.Downstream_Chang
 	throttle := time.Duration(d.options.Throttle) * time.Millisecond
 
 	// Walk through the dir
-	if d.options.Polling == false {
+	if !d.options.Polling {
 		newState = d.getWatchState()
 	} else {
 		walkDir(d.options.RemotePath, d.options.RemotePath, d.ignoreMatcher, newState, throttle)
@@ -306,7 +325,7 @@ func (d *Downstream) watch(stopChan chan struct{}) {
 		case <-stopChan:
 			return
 		case event, ok := <-d.events:
-			if ok == false {
+			if !ok {
 				return
 			}
 
@@ -336,9 +355,7 @@ func (d *Downstream) watch(stopChan chan struct{}) {
 }
 
 func (d *Downstream) applyChange(newState map[string]*remote.Change, fullPath string) {
-	if strings.HasSuffix(fullPath, "/") {
-		fullPath = fullPath[:len(fullPath)-1]
-	}
+	fullPath = strings.TrimSuffix(fullPath, "/")
 
 	relativePath := fullPath[len(d.options.RemotePath):]
 
@@ -355,12 +372,12 @@ func (d *Downstream) applyChange(newState map[string]*remote.Change, fullPath st
 	stat, err := os.Stat(fullPath)
 	if err != nil {
 		return
-	} else if d.ignoreMatcher != nil && d.ignoreMatcher.RequireFullScan() == false && d.ignoreMatcher.Matches(relativePath, stat.IsDir()) {
+	} else if d.ignoreMatcher != nil && !d.ignoreMatcher.RequireFullScan() && d.ignoreMatcher.Matches(relativePath, stat.IsDir()) {
 		return
 	}
 
 	if stat.IsDir() {
-		if d.ignoreMatcher == nil || d.ignoreMatcher.RequireFullScan() == false || d.ignoreMatcher.Matches(relativePath, true) == false {
+		if d.ignoreMatcher == nil || !d.ignoreMatcher.RequireFullScan() || !d.ignoreMatcher.Matches(relativePath, true) {
 			newState[fullPath] = &remote.Change{
 				Path:  fullPath,
 				IsDir: true,
@@ -369,12 +386,13 @@ func (d *Downstream) applyChange(newState map[string]*remote.Change, fullPath st
 
 		walkDir(d.options.RemotePath, fullPath, d.ignoreMatcher, newState, time.Duration(d.options.Throttle)*time.Millisecond)
 	} else {
-		if d.ignoreMatcher == nil || d.ignoreMatcher.RequireFullScan() == false || d.ignoreMatcher.Matches(relativePath, false) == false {
+		if d.ignoreMatcher == nil || !d.ignoreMatcher.RequireFullScan() || !d.ignoreMatcher.Matches(relativePath, false) {
 			newState[fullPath] = &remote.Change{
 				Path:          fullPath,
 				Size:          stat.Size(),
 				MtimeUnix:     stat.ModTime().Unix(),
 				MtimeUnixNano: stat.ModTime().UnixNano(),
+				Mode:          uint32(stat.Mode()),
 				IsDir:         false,
 			}
 		}
@@ -398,6 +416,7 @@ func copyState(state map[string]*remote.Change) map[string]*remote.Change {
 			MtimeUnix:     v.MtimeUnix,
 			MtimeUnixNano: v.MtimeUnixNano,
 			Size:          v.Size,
+			Mode:          v.Mode,
 			IsDir:         v.IsDir,
 		}
 	}
@@ -429,6 +448,7 @@ func streamChanges(basePath string, oldState map[string]*remote.Change, newState
 						MtimeUnix:     newFile.MtimeUnix,
 						MtimeUnixNano: newFile.MtimeUnixNano,
 						Size:          newFile.Size,
+						Mode:          newFile.Mode,
 						IsDir:         newFile.IsDir,
 					})
 				}
@@ -443,6 +463,7 @@ func streamChanges(basePath string, oldState map[string]*remote.Change, newState
 					MtimeUnix:     newFile.MtimeUnix,
 					MtimeUnixNano: newFile.MtimeUnixNano,
 					Size:          newFile.Size,
+					Mode:          newFile.Mode,
 					IsDir:         newFile.IsDir,
 				})
 			}
@@ -467,7 +488,7 @@ func streamChanges(basePath string, oldState map[string]*remote.Change, newState
 			time.Sleep(throttle)
 		}
 
-		if _, ok := newState[oldFile.Path]; ok == false {
+		if _, ok := newState[oldFile.Path]; !ok {
 			if stream != nil {
 				changes = append(changes, &remote.Change{
 					ChangeType:    remote.ChangeType_DELETE,
@@ -475,6 +496,7 @@ func streamChanges(basePath string, oldState map[string]*remote.Change, newState
 					MtimeUnix:     oldFile.MtimeUnix,
 					MtimeUnixNano: oldFile.MtimeUnixNano,
 					Size:          oldFile.Size,
+					Mode:          oldFile.Mode,
 					IsDir:         oldFile.IsDir,
 				})
 			}
@@ -512,6 +534,9 @@ func walkDir(basePath string, path string, ignoreMatcher ignoreparser.IgnorePars
 
 	for _, f := range files {
 		absolutePath := filepath.Join(path, f.Name())
+		if fsutil.IsRecursiveSymlink(f, absolutePath) {
+			continue
+		}
 
 		// Stat is necessary here, because readdir does not follow symlinks and
 		// IsDir() returns false for symlinked folders
@@ -522,7 +547,7 @@ func walkDir(basePath string, path string, ignoreMatcher ignoreparser.IgnorePars
 		}
 
 		// Check if ignored
-		if ignoreMatcher != nil && ignoreMatcher.RequireFullScan() == false && ignoreMatcher.Matches(absolutePath[len(basePath):], stat.IsDir()) {
+		if ignoreMatcher != nil && !ignoreMatcher.RequireFullScan() && ignoreMatcher.Matches(absolutePath[len(basePath):], stat.IsDir()) {
 			continue
 		}
 
@@ -534,7 +559,7 @@ func walkDir(basePath string, path string, ignoreMatcher ignoreparser.IgnorePars
 		// Check if directory
 		if stat.IsDir() {
 			// Check if not ignored
-			if ignoreMatcher == nil || ignoreMatcher.RequireFullScan() == false || ignoreMatcher.Matches(absolutePath[len(basePath):], true) == false {
+			if ignoreMatcher == nil || !ignoreMatcher.RequireFullScan() || !ignoreMatcher.Matches(absolutePath[len(basePath):], true) {
 				state[absolutePath] = &remote.Change{
 					Path:  absolutePath,
 					IsDir: true,
@@ -544,12 +569,13 @@ func walkDir(basePath string, path string, ignoreMatcher ignoreparser.IgnorePars
 			walkDir(basePath, absolutePath, ignoreMatcher, state, throttle)
 		} else {
 			// Check if not ignored
-			if ignoreMatcher == nil || ignoreMatcher.RequireFullScan() == false || ignoreMatcher.Matches(absolutePath[len(basePath):], false) == false {
+			if ignoreMatcher == nil || !ignoreMatcher.RequireFullScan() || !ignoreMatcher.Matches(absolutePath[len(basePath):], false) {
 				state[absolutePath] = &remote.Change{
 					Path:          absolutePath,
 					Size:          stat.Size(),
 					MtimeUnix:     stat.ModTime().Unix(),
 					MtimeUnixNano: stat.ModTime().UnixNano(),
+					Mode:          uint32(stat.Mode()),
 					IsDir:         false,
 				}
 			}

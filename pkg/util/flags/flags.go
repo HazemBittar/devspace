@@ -1,23 +1,24 @@
 package flags
 
 import (
-	"errors"
 	"fmt"
-	"github.com/spf13/cobra"
-	"os"
 	"strings"
+
+	"github.com/loft-sh/devspace/pkg/devspace/env"
+
+	"github.com/spf13/cobra"
 )
 
 // ApplyExtraFlags args parses the flags for a certain command from the environment variables
 func ApplyExtraFlags(cobraCmd *cobra.Command, osArgs []string, forceParsing bool) ([]string, error) {
-	envName := strings.ToUpper(strings.Replace(cobraCmd.CommandPath(), " ", "_", -1) + "_FLAGS")
+	envName := strings.ToUpper(strings.ReplaceAll(cobraCmd.CommandPath(), " ", "_") + "_FLAGS")
 
-	flags, err := ParseCommandLine(os.Getenv("DEVSPACE_FLAGS"))
+	flags, err := ParseCommandLine(env.GlobalGetEnv("DEVSPACE_FLAGS"))
 	if err != nil {
 		return nil, err
 	}
 
-	commandFlags, err := ParseCommandLine(os.Getenv(envName))
+	commandFlags, err := ParseCommandLine(env.GlobalGetEnv(envName))
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +97,7 @@ func ParseCommandLine(command string) ([]string, error) {
 	}
 
 	if state == "quotes" {
-		return []string{}, errors.New(fmt.Sprintf("Unclosed quote in command line: %s", command))
+		return []string{}, fmt.Errorf("unclosed quote in command line: %s", command)
 	}
 
 	if current != "" {

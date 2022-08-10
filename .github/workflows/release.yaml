@@ -21,33 +21,8 @@ on:
       - ".github/workflows/release.yaml"
 
 jobs:
-  test-linux:
-    runs-on: ubuntu-18.04
-    steps:
-      - name: Set up Go
-        uses: actions/setup-go@v1
-        with:
-          go-version: 1.16
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v1
-      - name: Test
-        run: ./hack/coverage.bash
-  test-windows:
-    if: github.ref != 'refs/heads/master'
-    runs-on: windows-2019
-    steps:
-      - name: Set up Go
-        uses: actions/setup-go@v1
-        with:
-          go-version: 1.16
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v1
-      - name: Test
-        run: ./hack/coverage.bash
-        shell: bash
   release-ui:
     if: startsWith(github.ref, 'refs/tags/v') == true
-    needs: [ test-linux ]
     runs-on: ubuntu-18.04
     steps:
       - uses: actions/checkout@v1
@@ -55,6 +30,10 @@ jobs:
         with:
           node-version: 12
           registry-url: https://registry.npmjs.org/
+      - id: get_version
+        run: |
+          RELEASE_VERSION=$(echo $GITHUB_REF | sed -nE 's!refs/tags/!!p')
+          echo "::set-output name=release_version::$RELEASE_VERSION"
       - name: Cache node modules
         uses: actions/cache@v1
         with:
@@ -64,6 +43,7 @@ jobs:
             ${{ runner.os }}-node-
       - name: Build UI
         env:
+          VERSION: ${{ steps.get_version.outputs.release_version }}
           NPM_CONFIG_GLOBALCONFIG: "dist/npm/config/npmrc"
           NPM_REGISTRY_TOKEN: ${{ secrets.NPM_DEVSPACE_REGISTRY_TOKEN }}
           CI: "false"
@@ -76,12 +56,16 @@ jobs:
   release:
     if: startsWith(github.ref, 'refs/tags/v') == true
     needs: [ release-ui ]
-    runs-on: macOS-latest
+    runs-on: macos-11
     steps:
       - name: Set up Go
         uses: actions/setup-go@v1
         with:
-          go-version: 1.16
+          go-version: 1.17
+      - id: get_version
+        run: |
+          RELEASE_VERSION=$(echo $GITHUB_REF | sed -nE 's!refs/tags/!!p')
+          echo "::set-output name=release_version::$RELEASE_VERSION"
       - name: install-go-bindata
         run: go get -u github.com/go-bindata/go-bindata/...
         env:
@@ -92,9 +76,12 @@ jobs:
         uses: actions/download-artifact@v2
         with:
           name: ui-tar
+      - name: install-upx
+        run: brew install upx
       - name: Compile binaries
         run: ./hack/build-all.bash
         env:
+          VERSION: ${{ steps.get_version.outputs.release_version }}
           GOPATH: /Users/runner/work/devspace/go
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
           ANALYTICS_TOKEN: ${{ secrets.ANALYTICS_TOKEN }}
@@ -115,16 +102,20 @@ jobs:
         with:
           node-version: 12
           registry-url: https://registry.npmjs.org/
+      - id: get_version
+        run: |
+          RELEASE_VERSION=$(echo $GITHUB_REF | sed -nE 's!refs/tags/!!p')
+          echo "::set-output name=release_version::$RELEASE_VERSION"
       - run: |
           npm ci
           export NPM_TAG=$(node index.js get-tag)
           npm publish --tag $NPM_TAG
         working-directory: ./dist/npm
         env:
+          RELEASE_VERSION: ${{ steps.get_version.outputs.release_version }}
           NODE_AUTH_TOKEN: ${{ secrets.NPMJS_TOKEN }}
   publish-next-image:
     if: github.ref == 'refs/heads/master'
-    needs: [test-linux]
     runs-on: ubuntu-18.04
     steps:
       - uses: actions/checkout@v1

@@ -1,9 +1,10 @@
 package sync
 
 import (
+	"os"
+
 	"github.com/loft-sh/devspace/helper/server"
 	"github.com/spf13/cobra"
-	"os"
 )
 
 // DownstreamCmd holds the downstream cmd flags
@@ -45,5 +46,6 @@ func (cmd *DownstreamCmd) Run(cobraCmd *cobra.Command, args []string) error {
 		Throttle:    cmd.Throttle,
 		Polling:     cmd.Polling,
 		ExitOnClose: true,
+		Ping:        true,
 	})
 }

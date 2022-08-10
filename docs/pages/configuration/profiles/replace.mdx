@@ -3,7 +3,7 @@ title: "Profiles: Replace"
 sidebar_label: replace
 ---
 
-import FragmentInfoPrintConfig from '../../fragments/tip-print-config.mdx';
+import FragmentInfoPrintConfig from '../../_partials/tip-print-config.mdx';
 
 ## Configuration
 
@@ -27,13 +27,12 @@ images:
   backend-debugger:
     image: john/debugger
 deployments:
-- name: app-backend
-  helm:
-    componentChart: true
-    values:
-      containers:
-      - image: john/devbackend
-      - image: john/debugger
+  app-backend:
+    helm:
+      values:
+        containers:
+        - image: john/devbackend
+        - image: john/debugger
 profiles:
 - name: production
   replace:
@@ -42,7 +41,7 @@ profiles:
         image: john/prodbackend
   patches:
   - op: remove
-    path: deployments[0].helm.values.containers[1]
+    path: deployments.app-backend.helm.values.containers[1]
 ```
 **Explanation:**  
 - The above example defines 1 profile: `production`
@@ -55,12 +54,11 @@ images:
   backend:
     image: john/prodbackend
 deployments:
-- name: app-backend
-  helm:
-    componentChart: true
-    values:
-      containers:
-      - image: john/prodbackend
+  app-backend:
+    helm:
+      values:
+        containers:
+        - image: john/prodbackend
 ```
 
 :::tip Combine Replace & Patches

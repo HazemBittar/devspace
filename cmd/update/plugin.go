@@ -42,15 +42,13 @@ func (cmd *pluginCmd) Run(f factory.Factory, args []string) error {
 		return err
 	} else if oldPlugin != nil {
 		// Execute plugin hook
-		err = plugin.ExecutePluginHookAt(*oldPlugin, "before_update")
+		err = plugin.ExecutePluginHookAt(*oldPlugin, "before:updatePlugin", "before_update")
 		if err != nil {
 			return err
 		}
 	}
 
-	f.GetLog().StartWait("Updating plugin " + args[0])
-	defer f.GetLog().StopWait()
-
+	f.GetLog().Info("Updating plugin " + args[0] + "...")
 	updatedPlugin, err := pluginManager.Update(args[0], cmd.Version)
 	if err != nil {
 		if newestVersion, ok := err.(*plugin.NewestVersionError); ok {
@@ -61,11 +59,10 @@ func (cmd *pluginCmd) Run(f factory.Factory, args []string) error {
 		return err
 	}
 
-	f.GetLog().StopWait()
 	f.GetLog().Donef("Successfully updated plugin %s", args[0])
 
 	// Execute plugin hook
-	err = plugin.ExecutePluginHookAt(*updatedPlugin, "after_update")
+	err = plugin.ExecutePluginHookAt(*updatedPlugin, "after:updatePlugin", "after_update")
 	if err != nil {
 		return err
 	}

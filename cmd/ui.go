@@ -1,20 +1,26 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	config2 "github.com/loft-sh/devspace/pkg/devspace/config"
-	"github.com/loft-sh/devspace/pkg/devspace/plugin"
+	"github.com/loft-sh/devspace/helper/util/port"
+	"github.com/loft-sh/devspace/pkg/devspace/config/localcache"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
+	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
 	"io/ioutil"
 	"net/http"
 	"time"
 
+	"github.com/loft-sh/devspace/pkg/devspace/hook"
+
+	config2 "github.com/loft-sh/devspace/pkg/devspace/config"
+	"github.com/loft-sh/devspace/pkg/devspace/plugin"
+
 	"github.com/loft-sh/devspace/cmd/flags"
-	"github.com/loft-sh/devspace/pkg/devspace/config/generated"
 	"github.com/loft-sh/devspace/pkg/devspace/server"
 	"github.com/loft-sh/devspace/pkg/util/factory"
 	"github.com/loft-sh/devspace/pkg/util/log"
-	"github.com/loft-sh/devspace/pkg/util/port"
 	"github.com/pkg/errors"
 	"github.com/skratchdot/open-golang/open"
 	"github.com/spf13/cobra"
@@ -68,23 +74,26 @@ Opens the localhost UI in the browser
 func (cmd *UICmd) RunUI(f factory.Factory) error {
 	// Set config root
 	cmd.log = f.GetLog()
-	configOptions := cmd.ToConfigOptions(cmd.log)
-	configLoader := f.NewConfigLoader(cmd.ConfigPath)
+	configOptions := cmd.ToConfigOptions()
+	configLoader, err := f.NewConfigLoader(cmd.ConfigPath)
+	if err != nil {
+		return err
+	}
 	configExists, err := configLoader.SetDevSpaceRoot(cmd.log)
 	if err != nil {
 		return err
 	}
 
 	// Search for an already existing server
-	if cmd.ForceServer == false && cmd.Dev == false && cmd.Host == "localhost" {
+	if !cmd.ForceServer && !cmd.Dev && cmd.Host == "localhost" {
 		checkPort := server.DefaultPort
 		if cmd.Port != 0 {
 			checkPort = cmd.Port
 		}
 
 		for i := 0; i < 20; i++ {
-			unused, err := port.CheckHostPort(cmd.Host, checkPort)
-			if unused == false {
+			available, _ := port.IsAvailable(fmt.Sprintf(":%d", checkPort))
+			if !available {
 				if i+1 == 20 {
 					return errors.Wrap(err, "check for open port")
 				}
@@ -114,7 +123,7 @@ func (cmd *UICmd) RunUI(f factory.Factory) error {
 
 				if serverVersion.DevSpace {
 					cmd.log.Infof("Found running UI server at %s", domain)
-					open.Start(domain)
+					_ = open.Start(domain)
 					return nil
 				}
 
@@ -127,51 +136,49 @@ func (cmd *UICmd) RunUI(f factory.Factory) error {
 	}
 
 	var (
-		config          config2.Config
-		generatedConfig *generated.Config
+		config     config2.Config
+		localCache localcache.Cache
 	)
 
-	if configExists {
-		// Load generated config
-		generatedConfig, err = configLoader.LoadGenerated(configOptions)
-		if err != nil {
-			return errors.Errorf("Error loading generated.yaml: %v", err)
-		}
-		configOptions.GeneratedConfig = generatedConfig
-	}
-
-	// Use last context if specified
-	err = cmd.UseLastContext(generatedConfig, cmd.log)
-	if err != nil {
-		return err
-	}
-
 	// Create kubectl client
-	client, err := f.NewKubeClientFromContext(cmd.KubeContext, cmd.Namespace, cmd.SwitchContext)
+	client, err := f.NewKubeClientFromContext(cmd.KubeContext, cmd.Namespace)
 	if err != nil {
 		return errors.Errorf("Unable to create new kubectl client: %v", err)
 	}
-	configOptions.KubeClient = client
 
-	// Warn the user if we deployed into a different context before
-	err = client.PrintWarning(generatedConfig, cmd.NoWarn, false, cmd.log)
+	if configExists {
+		// Load generated config
+		localCache, err = configLoader.LoadLocalCache()
+		if err != nil {
+			return errors.Errorf("Error loading generated.yaml: %v", err)
+		}
+	}
+
+	// If the current kube context or namespace is different than old,
+	// show warnings and reset kube client if necessary
+	client, err = kubectl.CheckKubeContext(client, localCache, cmd.NoWarn, cmd.SwitchContext, cmd.log)
 	if err != nil {
 		return err
 	}
 
 	// Load config
 	if configExists {
-		config, err = configLoader.Load(configOptions, cmd.log)
+		config, err = configLoader.LoadWithCache(context.Background(), localCache, client, configOptions, cmd.log)
 		if err != nil {
 			return err
 		}
 	}
 
+	// dev context
+	ctx := devspacecontext.NewContext(context.Background(), nil, cmd.log).
+		WithConfig(config).
+		WithKubeClient(client)
+
 	// Override error runtime handler
 	log.OverrideRuntimeErrorHandler(true)
 
 	// Execute plugin hook
-	err = plugin.ExecutePluginHook("ui")
+	err = hook.ExecuteHooks(ctx, nil, "ui")
 	if err != nil {
 		return err
 	}
@@ -183,13 +190,13 @@ func (cmd *UICmd) RunUI(f factory.Factory) error {
 	}
 
 	// Create server
-	server, err := server.NewServer(config, nil, cmd.Host, cmd.Dev, client.CurrentContext(), client.Namespace(), forcePort, cmd.log)
+	server, err := server.NewServer(ctx, cmd.Host, cmd.Dev, forcePort, nil)
 	if err != nil {
 		return err
 	}
 
 	// Open the browser
-	if cmd.Dev == false {
+	if !cmd.Dev {
 		go func(domain string) {
 			time.Sleep(time.Second * 2)
 			_ = open.Start("http://" + domain)

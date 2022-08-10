@@ -1,14 +1,15 @@
 package sync
 
 import (
+	"github.com/loft-sh/devspace/helper/remote"
 	"github.com/loft-sh/devspace/helper/server/ignoreparser"
+	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
+	"github.com/loft-sh/devspace/pkg/util/fsutil"
+	"github.com/loft-sh/devspace/pkg/util/log"
 	"io/ioutil"
 	"os"
 	"path"
-
-	"github.com/loft-sh/devspace/helper/remote"
-	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
-	"github.com/loft-sh/devspace/pkg/util/log"
+	"path/filepath"
 
 	"github.com/pkg/errors"
 )
@@ -49,18 +50,20 @@ func newInitialSyncer(options *initialSyncOptions) *initialSyncer {
 	return &initialSyncer{o: options}
 }
 
-func (i *initialSyncer) Run(remoteState map[string]*FileInformation) error {
+func (i *initialSyncer) Run(remoteState map[string]*FileInformation, localState map[string]*FileInformation) error {
 	// Here we calculate the delta between the remote and local state, the result of this operation
 	// are files we should download (new and override) and files we should upload (new and override)
 	download := remoteState
-	upload, err := i.CalculateDelta(download)
+	i.o.Log.Debugf("Initial Sync - Calculate Delta from Remote State")
+	upload, err := i.CalculateDelta(download, localState)
+	i.o.Log.Debugf("Initial Sync - Done Calculating Delta (Download: %d, Upload: %d)", len(download), len(upload))
 	if err != nil {
 		return errors.Wrap(err, "diff server client")
 	}
 
 	// Upstream initial sync
 	go func() {
-		if i.o.UpstreamDisabled == false {
+		if !i.o.UpstreamDisabled {
 			// Remove remote if mirror local
 			if len(download) > 0 && i.o.Strategy == latest.InitialSyncStrategyMirrorLocal {
 				deleteRemote := make([]*FileInformation, 0, len(download))
@@ -101,7 +104,7 @@ func (i *initialSyncer) Run(remoteState map[string]*FileInformation) error {
 	}()
 
 	// Download changes if enabled
-	if i.o.DownstreamDisabled == false {
+	if !i.o.DownstreamDisabled {
 		// Remove local if mirror remote
 		if len(upload) > 0 && i.o.Strategy == latest.InitialSyncStrategyMirrorRemote {
 			remoteChanges := make([]*remote.Change, 0, len(upload))
@@ -115,6 +118,7 @@ func (i *initialSyncer) Run(remoteState map[string]*FileInformation) error {
 					Path:          element.Name,
 					MtimeUnix:     element.Mtime,
 					MtimeUnixNano: element.MtimeNano,
+					Mode:          uint32(element.Mode),
 					Size:          element.Size,
 					IsDir:         element.IsDirectory,
 				})
@@ -138,6 +142,7 @@ func (i *initialSyncer) Run(remoteState map[string]*FileInformation) error {
 							Path:          element.Name,
 							MtimeUnix:     element.Mtime,
 							MtimeUnixNano: element.MtimeNano,
+							Mode:          uint32(element.Mode),
 							Size:          element.Size,
 							IsDir:         element.IsDirectory,
 						})
@@ -157,6 +162,7 @@ func (i *initialSyncer) Run(remoteState map[string]*FileInformation) error {
 						Path:          element.Name,
 						MtimeUnix:     element.Mtime,
 						MtimeUnixNano: element.MtimeNano,
+						Mode:          uint32(element.Mode),
 						Size:          element.Size,
 						IsDir:         element.IsDirectory,
 					})
@@ -174,7 +180,7 @@ func (i *initialSyncer) Run(remoteState map[string]*FileInformation) error {
 	return nil
 }
 
-func (i *initialSyncer) CalculateDelta(remoteState map[string]*FileInformation) ([]*FileInformation, error) {
+func (i *initialSyncer) CalculateDelta(remoteState map[string]*FileInformation, localState map[string]*FileInformation) ([]*FileInformation, error) {
 	strategy := i.o.Strategy
 	if i.o.Strategy == latest.InitialSyncStrategyMirrorRemote {
 		strategy = latest.InitialSyncStrategyPreferRemote
@@ -182,79 +188,141 @@ func (i *initialSyncer) CalculateDelta(remoteState map[string]*FileInformation) 
 		strategy = latest.InitialSyncStrategyPreferLocal
 	}
 
-	return i.deltaPath(i.o.LocalPath, remoteState, strategy, false)
+	return i.deltaState(remoteState, localState, strategy)
 }
 
-func (i *initialSyncer) deltaPath(absPath string, remoteState map[string]*FileInformation, strategy latest.InitialSyncStrategy, ignore bool) ([]*FileInformation, error) {
+func (i *initialSyncer) deltaState(remoteState map[string]*FileInformation, localState map[string]*FileInformation, strategy latest.InitialSyncStrategy) ([]*FileInformation, error) {
+	changes := make([]*FileInformation, 0, 1024)
+	for relativePath, stat := range localState {
+		absPath := path.Join(i.o.LocalPath, relativePath)
+		ignore := false
+
+		// Exclude changes on the upload exclude list
+		if i.o.UploadIgnoreMatcher != nil {
+			if i.o.UploadIgnoreMatcher.Matches(relativePath, stat.IsDirectory) {
+				i.o.FileIndex.Lock()
+				// Add to file map and prevent download if local file is newer than the remote one
+				if i.o.FileIndex.fileMap[relativePath] != nil {
+					if strategy == latest.InitialSyncStrategyPreferLocal || (strategy == latest.InitialSyncStrategyPreferNewest && i.o.FileIndex.fileMap[relativePath].Mtime < stat.Mtime) {
+						// Add it to the fileMap
+						i.o.FileIndex.Set(stat)
+
+						delete(remoteState, relativePath)
+					}
+				}
+
+				i.o.FileIndex.Unlock()
+				ignore = true
+			}
+		}
+
+		// Check for symlinks
+		if !ignore && stat.ResolvedLink {
+			_, err := i.o.AddSymlink(relativePath, absPath)
+			if err != nil {
+				return nil, err
+			}
+
+			i.o.Log.Infof("Symlink found at %s", absPath)
+		}
+
+		// Check if stat is somehow not there
+		if i.o.IgnoreMatcher != nil && !i.o.IgnoreMatcher.RequireFullScan() && i.o.IgnoreMatcher.Matches(relativePath, stat.IsDirectory) {
+			continue
+		}
+
+		if stat.IsDirectory {
+			// we don't need to recreate a directory that already exists locally
+			delete(remoteState, relativePath)
+
+			// should this directory be added?
+			if !ignore && stat.Files == 0 {
+				i.o.FileIndex.Lock()
+				action := i.decide(stat, strategy)
+				i.o.FileIndex.Unlock()
+
+				// This can be only uploadAction or noAction, since this is a directory
+				if action == uploadAction {
+					changes = append(changes, stat)
+				}
+			}
+
+			continue
+		}
+
+		if !ignore {
+			i.o.FileIndex.Lock()
+			action := i.decide(stat, strategy)
+			i.o.FileIndex.Unlock()
+			if action == uploadAction {
+				// If we upload the file, don't download it
+				delete(remoteState, relativePath)
+
+				// Add file to upload
+				// Make sure we use remote mode here
+				changes = append(changes, stat)
+			} else if action == noAction {
+				delete(remoteState, relativePath)
+			}
+		}
+	}
+
+	return changes, nil
+}
+
+func (i *initialSyncer) CalculateLocalState(absPath string, localState map[string]*FileInformation, ignore bool) error {
 	relativePath := getRelativeFromFullPath(absPath, i.o.LocalPath)
 
 	// We skip files that are suddenly not there anymore
 	stat, err := os.Stat(absPath)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 
 	// Exclude changes on the upload exclude list
 	if i.o.UploadIgnoreMatcher != nil {
 		if i.o.UploadIgnoreMatcher.Matches(relativePath, stat.IsDir()) {
-			i.o.FileIndex.Lock()
-			// Add to file map and prevent download if local file is newer than the remote one
-			if i.o.FileIndex.fileMap[relativePath] != nil {
-				if strategy == latest.InitialSyncStrategyPreferLocal || (strategy == latest.InitialSyncStrategyPreferNewest && i.o.FileIndex.fileMap[relativePath].Mtime < stat.ModTime().Unix()) {
-					// Add it to the fileMap
-					i.o.FileIndex.Set(&FileInformation{
-						Name:        relativePath,
-						Mtime:       stat.ModTime().Unix(),
-						MtimeNano:   stat.ModTime().UnixNano(),
-						Mode:        stat.Mode(),
-						Size:        stat.Size(),
-						IsDirectory: stat.IsDir(),
-					})
-
-					delete(remoteState, relativePath)
-				}
-			}
-
-			i.o.FileIndex.Unlock()
 			ignore = true
 		}
 	}
 
 	// Check for symlinks
-	if ignore == false {
+	isSymlink := false
+	if !ignore {
 		// Retrieve the real stat instead of the symlink one
 		lstat, err := os.Lstat(absPath)
 		if err == nil && lstat.Mode()&os.ModeSymlink != 0 {
-			stat, err = i.o.AddSymlink(relativePath, absPath)
+			// Get real path
+			targetPath, err := filepath.EvalSymlinks(absPath)
 			if err != nil {
-				return nil, err
-			}
-			if stat == nil {
-				return nil, nil
+				return nil
 			}
 
-			i.o.Log.Infof("Symlink found at %s", absPath)
+			stat, err = os.Stat(targetPath)
+			if err != nil {
+				return nil
+			}
+
+			isSymlink = true
 		} else if err != nil {
-			return nil, nil
+			return nil
 		}
 	}
 
 	// Check if stat is somehow not there
 	if stat == nil {
-		return nil, nil
-	} else if i.o.IgnoreMatcher != nil && i.o.IgnoreMatcher.RequireFullScan() == false && i.o.IgnoreMatcher.Matches(relativePath, stat.IsDir()) {
-		return nil, nil
+		return nil
+	} else if i.o.IgnoreMatcher != nil && !i.o.IgnoreMatcher.RequireFullScan() && i.o.IgnoreMatcher.Matches(relativePath, stat.IsDir()) {
+		return nil
 	}
 
 	if stat.IsDir() {
-		// we don't need to recreate a directory that already exists locally
-		delete(remoteState, relativePath)
-
-		return i.deltaDir(absPath, stat, remoteState, strategy, ignore)
+		return i.calculateLocalDirState(absPath, stat, localState, isSymlink, ignore)
 	}
 
-	if ignore == false {
-		fileInfo := &FileInformation{
+	if !ignore {
+		// Add file to upload
+		localState[relativePath] = &FileInformation{
 			Name:           relativePath,
 			Mtime:          stat.ModTime().Unix(),
 			MtimeNano:      stat.ModTime().UnixNano(),
@@ -262,37 +330,23 @@ func (i *initialSyncer) deltaPath(absPath string, remoteState map[string]*FileIn
 			Mode:           stat.Mode(),
 			IsDirectory:    false,
 			IsSymbolicLink: stat.Mode()&os.ModeSymlink != 0,
-		}
-
-		i.o.FileIndex.Lock()
-		action := i.decide(fileInfo, strategy)
-		i.o.FileIndex.Unlock()
-		if action == uploadAction {
-			// If we upload the file, don't download it
-			delete(remoteState, relativePath)
-
-			// Add file to upload
-			return []*FileInformation{fileInfo}, nil
-		} else if action == noAction {
-			delete(remoteState, relativePath)
+			ResolvedLink:   isSymlink,
 		}
 	}
 
-	return nil, nil
+	return nil
 }
 
-func (i *initialSyncer) deltaDir(filepath string, stat os.FileInfo, remoteState map[string]*FileInformation, strategy latest.InitialSyncStrategy, ignore bool) ([]*FileInformation, error) {
-	relativePath := getRelativeFromFullPath(filepath, i.o.LocalPath)
-
-	files, err := ioutil.ReadDir(filepath)
+func (i *initialSyncer) calculateLocalDirState(absPath string, stat os.FileInfo, localState map[string]*FileInformation, isSymlink, ignore bool) error {
+	relativePath := getRelativeFromFullPath(absPath, i.o.LocalPath)
+	files, err := ioutil.ReadDir(absPath)
 	if err != nil {
-		i.o.Log.Infof("Couldn't read dir %s: %v", filepath, err)
-		return nil, nil
+		i.o.Log.Infof("Couldn't read dir %s: %v", absPath, err)
+		return nil
 	}
 
-	upload := []*FileInformation{}
-	if len(files) == 0 && relativePath != "" && ignore == false && stat != nil {
-		fileInfo := &FileInformation{
+	if relativePath != "" && !ignore && stat != nil {
+		localState[relativePath] = &FileInformation{
 			Name:           relativePath,
 			Mtime:          stat.ModTime().Unix(),
 			MtimeNano:      stat.ModTime().UnixNano(),
@@ -300,28 +354,24 @@ func (i *initialSyncer) deltaDir(filepath string, stat os.FileInfo, remoteState 
 			Mode:           stat.Mode(),
 			IsDirectory:    true,
 			IsSymbolicLink: stat.Mode()&os.ModeSymlink != 0,
-		}
-
-		i.o.FileIndex.Lock()
-		action := i.decide(fileInfo, strategy)
-		i.o.FileIndex.Unlock()
-
-		// This can be only uploadAction or noAction, since this is a directory
-		if action == uploadAction {
-			upload = append(upload, fileInfo)
+			ResolvedLink:   isSymlink,
+			Files:          len(files),
 		}
 	}
 
 	for _, f := range files {
-		changes, err := i.deltaPath(path.Join(filepath, f.Name()), remoteState, strategy, ignore)
-		if err != nil {
-			return nil, errors.Wrap(err, f.Name())
+		if fsutil.IsRecursiveSymlink(f, filepath.Join(absPath, f.Name())) {
+			i.o.Log.Debugf("Found recursive symlink at %v", filepath.Join(absPath, f.Name()))
+			continue
 		}
 
-		upload = append(upload, changes...)
+		err := i.CalculateLocalState(filepath.Join(absPath, f.Name()), localState, ignore)
+		if err != nil {
+			return errors.Wrap(err, f.Name())
+		}
 	}
 
-	return upload, nil
+	return nil
 }
 
 type action int
@@ -364,6 +414,10 @@ func (i *initialSyncer) decide(fileInformation *FileInformation, strategy latest
 
 		// File did not change or was changed by downstream
 		if fileInformation.Size == i.o.FileIndex.fileMap[fileInformation.Name].Size {
+			if strategy == latest.InitialSyncStrategyPreferLocal && !equalFilePermissions(fileInformation.Mode, i.o.FileIndex.fileMap[fileInformation.Name].Mode) {
+				return uploadAction
+			}
+
 			if fileInformation.Mtime == i.o.FileIndex.fileMap[fileInformation.Name].Mtime {
 				return noAction
 			} else if i.o.CompareBy == latest.InitialSyncCompareBySize {

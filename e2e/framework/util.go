@@ -1,20 +1,24 @@
 package framework
 
 import (
+	"context"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"sync"
+
 	"github.com/loft-sh/devspace/pkg/devspace/config"
 	"github.com/loft-sh/devspace/pkg/devspace/config/loader"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
 	"github.com/loft-sh/devspace/pkg/devspace/dependency"
 	"github.com/loft-sh/devspace/pkg/devspace/dependency/types"
+	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
 	"github.com/loft-sh/devspace/pkg/util/factory"
 	"github.com/loft-sh/devspace/pkg/util/message"
 	"github.com/onsi/ginkgo"
 	"github.com/otiai10/copy"
 	"github.com/pkg/errors"
-	"io/ioutil"
-	"os"
-	"path/filepath"
-	"sync"
 )
 
 func BeforeAll(body func()) {
@@ -26,7 +30,7 @@ func BeforeAll(body func()) {
 	})
 }
 
-func LoadConfigWithOptionsAndResolve(f factory.Factory, configPath string, configOptions *loader.ConfigOptions, resolveOptions dependency.ResolveOptions) (config.Config, []types.Dependency, error) {
+func LoadConfigWithOptionsAndResolve(f factory.Factory, client kubectl.Client, configPath string, configOptions *loader.ConfigOptions, resolveOptions dependency.ResolveOptions) (config.Config, []types.Dependency, error) {
 	before, err := os.Getwd()
 	if err != nil {
 		return nil, nil, err
@@ -35,7 +39,10 @@ func LoadConfigWithOptionsAndResolve(f factory.Factory, configPath string, confi
 
 	// Set config root
 	log := f.GetLog()
-	configLoader := f.NewConfigLoader(configPath)
+	configLoader, err := f.NewConfigLoader(configPath)
+	if err != nil {
+		return nil, nil, err
+	}
 	configExists, err := configLoader.SetDevSpaceRoot(log)
 	if err != nil {
 		return nil, nil, err
@@ -44,13 +51,16 @@ func LoadConfigWithOptionsAndResolve(f factory.Factory, configPath string, confi
 	}
 
 	// load config
-	loadedConfig, err := configLoader.Load(configOptions, log)
+	loadedConfig, err := configLoader.Load(context.Background(), client, configOptions, log)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	// set devspacecontext
+	ctx := devspacecontext.NewContext(context.Background(), loadedConfig.Variables(), log).WithConfig(loadedConfig)
+
 	// resolve dependencies
-	dependencies, err := dependency.NewManager(loadedConfig, nil, configOptions, log).ResolveAll(resolveOptions)
+	dependencies, err := dependency.NewManager(ctx, configOptions).ResolveAll(ctx, resolveOptions)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error resolving dependencies: %v", err)
 	}
@@ -58,12 +68,12 @@ func LoadConfigWithOptionsAndResolve(f factory.Factory, configPath string, confi
 	return loadedConfig, dependencies, nil
 }
 
-func LoadConfigWithOptions(f factory.Factory, configPath string, configOptions *loader.ConfigOptions) (config.Config, []types.Dependency, error) {
-	return LoadConfigWithOptionsAndResolve(f, configPath, configOptions, dependency.ResolveOptions{})
+func LoadConfigWithOptions(f factory.Factory, client kubectl.Client, configPath string, configOptions *loader.ConfigOptions) (config.Config, []types.Dependency, error) {
+	return LoadConfigWithOptionsAndResolve(f, client, configPath, configOptions, dependency.ResolveOptions{})
 }
 
-func LoadConfig(f factory.Factory, configPath string) (config.Config, []types.Dependency, error) {
-	return LoadConfigWithOptions(f, configPath, &loader.ConfigOptions{})
+func LoadConfig(f factory.Factory, client kubectl.Client, configPath string) (config.Config, []types.Dependency, error) {
+	return LoadConfigWithOptions(f, client, configPath, &loader.ConfigOptions{})
 }
 
 func InterruptChan() (chan error, func()) {
@@ -90,7 +100,7 @@ func CleanupTempDir(initialDir, tempDir string) {
 }
 
 func CopyToTempDir(relativePath string) (string, error) {
-	dir, err := ioutil.TempDir("", "")
+	dir, err := ioutil.TempDir("", "temp-*")
 	if err != nil {
 		return "", err
 	}

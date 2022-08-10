@@ -1,23 +1,32 @@
 package kubectl
 
 import (
+	"context"
 	"fmt"
-	"github.com/ghodss/yaml"
-	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
-	"github.com/loft-sh/devspace/pkg/util/log"
-	"github.com/pkg/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"github.com/loft-sh/devspace/pkg/devspace/pipeline/env"
+	"io/ioutil"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"mvdan.cc/sh/v3/expand"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+
+	"github.com/loft-sh/devspace/pkg/util/constraint"
+
+	"github.com/ghodss/yaml"
+	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
+	"github.com/loft-sh/devspace/pkg/util/command"
+	"github.com/loft-sh/devspace/pkg/util/log"
+	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // Builder is the manifest builder interface
 type Builder interface {
-	Build(manifest string, executor RunCommand) ([]*unstructured.Unstructured, error)
+	Build(ctx context.Context, environ expand.Environ, dir, manifest string) ([]*unstructured.Unstructured, error)
 }
-
-type RunCommand func(path string, args []string) ([]byte, error)
 
 type kustomizeBuilder struct {
 	path   string
@@ -33,13 +42,13 @@ func NewKustomizeBuilder(path string, config *latest.DeploymentConfig, log log.L
 	}
 }
 
-func (k *kustomizeBuilder) Build(manifest string, cmd RunCommand) ([]*unstructured.Unstructured, error) {
+func (k *kustomizeBuilder) Build(ctx context.Context, environ expand.Environ, dir, manifest string) ([]*unstructured.Unstructured, error) {
 	args := []string{"build", manifest}
 	args = append(args, k.config.Kubectl.KustomizeArgs...)
 
 	// Execute command
 	k.log.Infof("Render manifests with 'kustomize %s'", strings.Join(args, " "))
-	output, err := cmd(k.path, args)
+	output, err := command.Output(ctx, dir, environ, k.path, args...)
 	if err != nil {
 		exitError, ok := err.(*exec.ExitError)
 		if ok {
@@ -53,35 +62,79 @@ func (k *kustomizeBuilder) Build(manifest string, cmd RunCommand) ([]*unstructur
 }
 
 type kubectlBuilder struct {
-	path        string
-	config      *latest.DeploymentConfig
-	context     string
-	namespace   string
-	isInCluster bool
+	path       string
+	config     *latest.DeploymentConfig
+	kubeConfig clientcmdapi.Config
 }
 
 // NewKubectlBuilder creates a new kubectl manifest builder
-func NewKubectlBuilder(path string, config *latest.DeploymentConfig, context, namespace string, isInCluster bool) Builder {
+func NewKubectlBuilder(path string, config *latest.DeploymentConfig, kubeConfig clientcmdapi.Config) Builder {
 	return &kubectlBuilder{
-		path:        path,
-		config:      config,
-		context:     context,
-		namespace:   namespace,
-		isInCluster: isInCluster,
+		path:       path,
+		config:     config,
+		kubeConfig: kubeConfig,
 	}
 }
 
-func (k *kubectlBuilder) Build(manifest string, cmd RunCommand) ([]*unstructured.Unstructured, error) {
-	args := []string{"create"}
-	if k.context != "" && k.isInCluster == false {
-		args = append(args, "--context", k.context)
-	}
-	if k.namespace != "" {
-		args = append(args, "--namespace", k.namespace)
+// this function is called in Build function
+// to decide the --dry-run value
+var useOldDryRun = func(ctx context.Context, environ expand.Environ, dir, path string) (bool, error) {
+	// compare kubectl version for --dry-run flag value
+	out, err := command.Output(ctx, dir, environ, path, "version", "--client", "--short")
+	if err != nil {
+		return false, err
 	}
 
-	args = append(args, "--dry-run", "--output", "yaml", "--validate=false")
-	if k.config.Kubectl.Kustomize != nil && *k.config.Kubectl.Kustomize == true {
+	v1, err := constraint.NewVersion(strings.TrimPrefix(strings.TrimSpace(string(out)), "Client Version: v"))
+	if err != nil {
+		return false, nil
+	}
+
+	v2, err := constraint.NewVersion("1.18.0")
+	if err != nil {
+		return false, err
+	}
+
+	if v1.LessThan(v2) {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func (k *kubectlBuilder) Build(ctx context.Context, environ expand.Environ, dir, manifest string) ([]*unstructured.Unstructured, error) {
+	tempFile, err := ioutil.TempFile("", "")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tempFile.Name())
+
+	data, err := clientcmd.Write(k.kubeConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = tempFile.Write(data)
+	if err != nil {
+		return nil, err
+	}
+	_ = tempFile.Close()
+
+	args := []string{"create"}
+
+	// decides which --dry-run value is to be used
+	uodr, err := useOldDryRun(ctx, environ, dir, k.path)
+	if err != nil {
+		return nil, err
+	}
+
+	if uodr {
+		args = append(args, "--dry-run", "--output", "yaml", "--validate=false")
+	} else {
+		args = append(args, "--dry-run=client", "--output", "yaml", "--validate=false")
+	}
+
+	if k.config.Kubectl.Kustomize != nil && *k.config.Kubectl.Kustomize {
 		args = append(args, "--kustomize", manifest)
 	} else {
 		args = append(args, "--filename", manifest)
@@ -91,7 +144,9 @@ func (k *kubectlBuilder) Build(manifest string, cmd RunCommand) ([]*unstructured
 	args = append(args, k.config.Kubectl.CreateArgs...)
 
 	// Execute command
-	output, err := cmd(k.path, args)
+	output, err := command.Output(ctx, dir, env.NewVariableEnvProvider(environ, map[string]string{
+		"KUBECONFIG": tempFile.Name(),
+	}), k.path, args...)
 	if err != nil {
 		exitError, ok := err.(*exec.ExitError)
 		if ok {

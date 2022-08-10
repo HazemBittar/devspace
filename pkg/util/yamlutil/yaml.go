@@ -1,12 +1,72 @@
 package yamlutil
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 
-	yaml "gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v3"
 )
+
+// UnmarshalString decodes the given string into an object and returns a prettified string
+func UnmarshalString(data string, out interface{}) error {
+	return Unmarshal([]byte(data), out)
+}
+
+var lineRegEx = regexp.MustCompile(`^line ([0-9]+):`)
+
+func UnmarshalStrictJSON(data []byte, out interface{}) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(out)
+}
+
+func UnmarshalStrict(data []byte, out interface{}) error {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	err := decoder.Decode(out)
+	return prettifyError(data, err)
+}
+
+// Unmarshal decodes the given byte into an object and returns a prettified string
+func Unmarshal(data []byte, out interface{}) error {
+	err := yaml.Unmarshal(data, out)
+	return prettifyError(data, err)
+}
+
+func prettifyError(data []byte, err error) error {
+	// check if type error
+	if typeError, ok := err.(*yaml.TypeError); ok {
+		for i := range typeError.Errors {
+			typeError.Errors[i] = strings.ReplaceAll(typeError.Errors[i], "!!seq", "an array")
+			typeError.Errors[i] = strings.ReplaceAll(typeError.Errors[i], "!!str", "string")
+			typeError.Errors[i] = strings.ReplaceAll(typeError.Errors[i], "!!map", "an object")
+			typeError.Errors[i] = strings.ReplaceAll(typeError.Errors[i], "!!int", "number")
+			typeError.Errors[i] = strings.ReplaceAll(typeError.Errors[i], "!!bool", "boolean")
+
+			// add line to error
+			match := lineRegEx.FindSubmatch([]byte(typeError.Errors[i]))
+			if len(match) > 1 {
+				line, lineErr := strconv.Atoi(string(match[1]))
+				if lineErr == nil {
+					line = line - 1
+					lines := strings.Split(string(data), "\n")
+					if line < len(lines) {
+						typeError.Errors[i] += fmt.Sprintf(" (line %d: %s)", line+1, strings.TrimSpace(lines[line]))
+					}
+				}
+			}
+		}
+	}
+
+	return err
+}
 
 // Convert converts an map[interface{}] to map[string] type
 func Convert(i interface{}) interface{} {
@@ -15,12 +75,6 @@ func Convert(i interface{}) interface{} {
 		m2 := map[string]interface{}{}
 		for k, v := range x {
 			m2[k] = Convert(v)
-		}
-		return m2
-	case map[interface{}]interface{}:
-		m2 := map[string]interface{}{}
-		for k, v := range x {
-			m2[k.(string)] = Convert(v)
 		}
 		return m2
 	case []interface{}:
@@ -55,14 +109,14 @@ func ReadYamlFromFile(filePath string, yamlTarget interface{}) error {
 	return yaml.Unmarshal(yamlFile, yamlTarget)
 }
 
-// ToInterfaceMap converts to yaml and back to generate map[interface{}]interface{}
-func ToInterfaceMap(yamlData interface{}) (map[interface{}]interface{}, error) {
+// ToInterfaceMap converts to yaml and back to generate map[string]interface{}
+func ToInterfaceMap(yamlData interface{}) (map[string]interface{}, error) {
 	yamlString, err := yaml.Marshal(yamlData)
 	if err != nil {
 		return nil, err
 	}
 
-	interfaceMap := map[interface{}]interface{}{}
+	interfaceMap := map[string]interface{}{}
 
 	err = yaml.Unmarshal(yamlString, interfaceMap)
 	if err != nil {

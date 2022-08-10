@@ -2,6 +2,13 @@ package tunnel
 
 import (
 	"fmt"
+	"github.com/loft-sh/devspace/pkg/devspace/kubectl/portforward"
+	"github.com/mgutz/ansi"
+	"io"
+	"net"
+	"strings"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/loft-sh/devspace/helper/remote"
 	"github.com/loft-sh/devspace/helper/tunnel"
@@ -10,16 +17,7 @@ import (
 	logpkg "github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
-	"io"
-	"net"
-	"strings"
-	"time"
 )
-
-type Message struct {
-	c *net.Conn
-	d *[]byte
-}
 
 func ReceiveData(stream remote.Tunnel_InitTunnelClient, closeStream <-chan bool, sessionsOut chan<- *tunnel.Session, port int32, scheme string, log logpkg.Logger) error {
 loop:
@@ -36,17 +34,24 @@ loop:
 		default:
 			if err != nil {
 				return fmt.Errorf("error reading from stream: %v", err)
+			} else if m.HasErr {
+				_ = stream.CloseSend()
+				if m.LogMessage == nil {
+					return fmt.Errorf("remote error: unknown")
+				}
+
+				return fmt.Errorf("helper error: %s", m.LogMessage.Message)
 			}
 
-			requestId, err := uuid.Parse(m.RequestId)
+			requestID, err := uuid.Parse(m.RequestId)
 			if err != nil {
 				log.Errorf("%s; failed parsing session uuid from stream, skipping", m.RequestId)
 				continue
 			}
 
-			session, exists := tunnel.GetSession(requestId)
-			if exists == false {
-				log.Debugf("new connection %s", requestId)
+			session, exists := tunnel.GetSession(requestID)
+			if !exists {
+				log.Debugf("new connection %s", requestID)
 
 				// new session
 				conn, err := net.DialTimeout(strings.ToLower(scheme), fmt.Sprintf("localhost:%d", port), time.Millisecond*500)
@@ -54,7 +59,7 @@ loop:
 					log.Errorf("failed connecting to localhost on port %d scheme %s: %v", port, scheme, err)
 					// close the remote connection
 					resp := &remote.SocketDataRequest{
-						RequestId:   requestId.String(),
+						RequestId:   requestID.String(),
 						ShouldClose: true,
 					}
 					err := stream.Send(resp)
@@ -65,7 +70,7 @@ loop:
 					continue
 				}
 
-				session, err = tunnel.NewSessionFromStream(requestId, conn)
+				session, err = tunnel.NewSessionFromStream(requestID, conn)
 				if err != nil {
 					log.Errorf("%s; error creating new session from stream: %v", m.RequestId, err)
 					continue
@@ -84,7 +89,7 @@ loop:
 }
 
 func handleStreamData(m *remote.SocketDataResponse, session *tunnel.Session, log logpkg.Logger) {
-	if session.Open == false {
+	if !session.Open {
 		session.Close()
 		return
 	}
@@ -97,7 +102,7 @@ func handleStreamData(m *remote.SocketDataResponse, session *tunnel.Session, log
 		session.Unlock()
 		log.Debugf("wrote %d bytes to conn", len(data))
 		if err != nil {
-			log.Warnf("%s: failed writing to socket, closing session: %v", session.Id.String(), err)
+			log.Warnf("%s: failed writing to socket, closing session: %v", session.ID.String(), err)
 			session.Close()
 			return
 		}
@@ -105,8 +110,8 @@ func handleStreamData(m *remote.SocketDataResponse, session *tunnel.Session, log
 }
 
 func ReadFromSession(session *tunnel.Session, sessionsOut chan<- *tunnel.Session, log logpkg.Logger) {
-	log.Debugf("started reading conn %s", session.Id)
-	defer log.Debugf("finished reading conn %s", session.Id)
+	log.Debugf("started reading conn %s", session.ID)
+	defer log.Debugf("finished reading conn %s", session.ID)
 
 	conn := session.Conn
 	buff := make([]byte, tunnel.BufferSize)
@@ -120,7 +125,7 @@ loop:
 		default:
 			if err != nil {
 				if err != io.EOF {
-					log.Errorf("%s: failed reading from socket, exiting: %v", session.Id.String(), err)
+					log.Errorf("%s: failed reading from socket, exiting: %v", session.ID.String(), err)
 				} else {
 					log.Debugf("read EOF from conn")
 				}
@@ -137,7 +142,7 @@ loop:
 				log.Debugf("wrote %d bytes to session", br)
 			}
 			if err != nil {
-				log.Errorf("%s: failed writing to session buffer: %v", session.Id, err)
+				log.Errorf("%s: failed writing to session buffer: %v", session.ID, err)
 				break loop
 			}
 
@@ -166,7 +171,7 @@ func SendData(stream remote.Tunnel_InitTunnelClient, sessions <-chan *tunnel.Ses
 			}
 			log.Debugf("read %d from buffer out of %d available", len(bytes), bys)
 			resp := &remote.SocketDataRequest{
-				RequestId:   session.Id.String(),
+				RequestId:   session.ID.String(),
 				Data:        bytes,
 				ShouldClose: !session.Open,
 			}
@@ -182,10 +187,10 @@ func SendData(stream remote.Tunnel_InitTunnelClient, sessions <-chan *tunnel.Ses
 	}
 }
 
-func StartReverseForward(reader io.ReadCloser, writer io.WriteCloser, tunnels []*latest.PortMapping, stopChan chan error, namespace string, name string, log logpkg.Logger) error {
+func StartReverseForward(ctx context.Context, reader io.ReadCloser, writer io.WriteCloser, tunnels []*latest.PortMapping, stopChan chan struct{}, namespace string, name string, log logpkg.Logger) error {
 	scheme := "TCP"
 	closeStreams := make([]chan bool, len(tunnels))
-	go func() {
+	defer func() {
 		for _, c := range closeStreams {
 			if c == nil {
 				continue
@@ -200,24 +205,48 @@ func StartReverseForward(reader io.ReadCloser, writer io.WriteCloser, tunnels []
 	if err != nil {
 		return errors.Wrap(err, "new client connection")
 	}
+
 	client := remote.NewTunnelClient(conn)
 	logFile := logpkg.GetFileLogger("reverse-portforwarding")
 
-	errorsChan := make(chan error, 2*len(tunnels))
+	errorsChan := make(chan error, 2*len(tunnels)+1)
+	closeStream := make(chan struct{})
+	defer close(closeStream)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-closeStream:
+				return
+			case <-stopChan:
+				return
+			case <-time.After(time.Second * 20):
+				ctx, cancel := context.WithTimeout(ctx, time.Second*20)
+				_, err := client.Ping(ctx, &remote.Empty{})
+				cancel()
+				if err != nil {
+					errorsChan <- errors.Wrap(err, "ping connection")
+					return
+				}
+			}
+		}
+	}()
+
 	for i, portMapping := range tunnels {
-		if portMapping.LocalPort == nil {
+		if portMapping.Port == "" {
 			return fmt.Errorf("local port cannot be undefined")
 		}
 
-		localPort := *portMapping.LocalPort
-		remotePort := localPort
-		if portMapping.RemotePort != nil {
-			remotePort = *portMapping.RemotePort
+		mappings, err := portforward.ParsePorts([]string{portMapping.Port})
+		if err != nil {
+			return fmt.Errorf("error parsing port %s: %v", portMapping.Port, err)
 		}
 
+		localPort := mappings[0].Local
+		remotePort := mappings[0].Remote
 		c := make(chan bool, 1)
 		go func(closeStream chan bool, localPort, remotePort int32) {
-			ctx := context.Background()
 			tunnelScheme, ok := remote.TunnelScheme_value[scheme]
 			if !ok {
 				errorsChan <- fmt.Errorf("unsupported connection scheme %s", scheme)
@@ -255,13 +284,15 @@ func StartReverseForward(reader io.ReadCloser, writer io.WriteCloser, tunnels []
 			}()
 
 			// wait until close
-			log.Donef("Reverse port forwarding started at %d:%d (%s/%s)", remotePort, localPort, namespace, name)
+			log.Donef("Port forwarding started on: %s", ansi.Color(fmt.Sprintf("%d <- %d", localPort, remotePort), "white+b"))
 			<-closeStream
 		}(c, int32(localPort), int32(remotePort))
 		closeStreams[i] = c
 	}
 
 	select {
+	case <-ctx.Done():
+		return nil
 	case err := <-errorsChan:
 		return err
 	case <-stopChan:

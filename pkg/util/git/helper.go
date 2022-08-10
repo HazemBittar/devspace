@@ -1,11 +1,14 @@
 package git
 
 import (
+	"context"
+	"github.com/loft-sh/devspace/pkg/util/command"
+	"mvdan.cc/sh/v3/expand"
+	"os"
+	"strings"
+
 	"github.com/pkg/errors"
 	"gopkg.in/src-d/go-git.v4"
-	"os"
-	"os/exec"
-	"strings"
 )
 
 // GetBranch retrieves the current HEADs name
@@ -24,12 +27,12 @@ func GetBranch(localPath string) (string, error) {
 }
 
 // GetHash retrieves the current HEADs hash
-func GetHash(localPath string) (string, error) {
+func GetHash(ctx context.Context, localPath string) (string, error) {
 	repo, err := git.PlainOpen(localPath)
 	if err != nil {
 		// last resort, try with cli
-		if isGitCommandAvailable() {
-			out, err := exec.Command("git", "rev-parse", "HEAD").CombinedOutput()
+		if isGitCommandAvailable(ctx) {
+			out, err := command.CombinedOutput(ctx, localPath, expand.ListEnviron(os.Environ()...), "git", "rev-parse", "HEAD")
 			if err != nil {
 				return "", errors.Errorf("Error running 'git rev-parse HEAD': %v -> %s", err, string(out))
 			}

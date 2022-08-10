@@ -1,18 +1,14 @@
 package yamlutil
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
-	
+
 	"gotest.tools/assert"
 )
 
 func TestWriteRead(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test")
-	if err != nil {
-		t.Fatalf("Error creating temporary directory: %v", err)
-	}
+	dir := t.TempDir()
 
 	wdBackup, err := os.Getwd()
 	if err != nil {
@@ -29,12 +25,8 @@ func TestWriteRead(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Error changing dir back: %v", err)
 		}
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Fatalf("Error removing dir: %v", err)
-		}
 	}()
-	
+
 	inputObj := make(map[string]interface{})
 	arr0 := make(map[string]interface{})
 	arr0["testString"] = "hello"
@@ -50,7 +42,6 @@ func TestWriteRead(t *testing.T) {
 	inputObj["testBoolString"] = "false"
 	inputObj["testEmptyString"] = ""
 	inputObj["testInt"] = 1
-	
 
 	err = WriteYamlToFile(inputObj, "yaml.yaml")
 	if err != nil {
@@ -69,12 +60,12 @@ func TestWriteRead(t *testing.T) {
 	assert.Equal(t, inputObj["testEmptyString"], outputObj["testEmptyString"], "Readed yaml doesn't match written yaml")
 	assert.Equal(t, inputObj["testInt"], outputObj["testInt"], "Readed yaml doesn't match written yaml")
 
-	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testString"], outputObj["someArr"].([]interface{})[0].(map[interface{}]interface{})["testString"], "Readed yaml doesn't match written yaml")
-	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testTrue"], outputObj["someArr"].([]interface{})[0].(map[interface{}]interface{})["testTrue"], "Readed yaml doesn't match written yaml")
-	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testFalse"], outputObj["someArr"].([]interface{})[0].(map[interface{}]interface{})["testFalse"], "Readed yaml doesn't match written yaml")
-	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testBoolString"], outputObj["someArr"].([]interface{})[0].(map[interface{}]interface{})["testBoolString"], "Readed yaml doesn't match written yaml")
-	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testEmptyString"], outputObj["someArr"].([]interface{})[0].(map[interface{}]interface{})["testEmptyString"], "Readed yaml doesn't match written yaml")
-	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testInt"], outputObj["someArr"].([]interface{})[0].(map[interface{}]interface{})["testInt"], "Readed yaml doesn't match written yaml")
+	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testString"], outputObj["someArr"].([]interface{})[0].(map[string]interface{})["testString"], "Readed yaml doesn't match written yaml")
+	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testTrue"], outputObj["someArr"].([]interface{})[0].(map[string]interface{})["testTrue"], "Readed yaml doesn't match written yaml")
+	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testFalse"], outputObj["someArr"].([]interface{})[0].(map[string]interface{})["testFalse"], "Readed yaml doesn't match written yaml")
+	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testBoolString"], outputObj["someArr"].([]interface{})[0].(map[string]interface{})["testBoolString"], "Readed yaml doesn't match written yaml")
+	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testEmptyString"], outputObj["someArr"].([]interface{})[0].(map[string]interface{})["testEmptyString"], "Readed yaml doesn't match written yaml")
+	assert.Equal(t, inputObj["someArr"].([]interface{})[0].(map[string]interface{})["testInt"], outputObj["someArr"].([]interface{})[0].(map[string]interface{})["testInt"], "Readed yaml doesn't match written yaml")
 
 	assert.Equal(t, inputObj["someArr"].([]interface{})[1], outputObj["someArr"].([]interface{})[1], "Readed yaml doesn't match written yaml")
 	assert.Equal(t, inputObj["someArr"].([]interface{})[2], outputObj["someArr"].([]interface{})[2], "Readed yaml doesn't match written yaml")

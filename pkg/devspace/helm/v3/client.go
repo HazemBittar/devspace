@@ -1,6 +1,9 @@
 package v3
 
 import (
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
+	dependencyutil "github.com/loft-sh/devspace/pkg/devspace/dependency/util"
+	"github.com/sirupsen/logrus"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -9,66 +12,23 @@ import (
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	"github.com/loft-sh/devspace/pkg/devspace/helm/generic"
 	"github.com/loft-sh/devspace/pkg/devspace/helm/types"
-	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
-	"github.com/loft-sh/devspace/pkg/util/command"
+	"github.com/loft-sh/devspace/pkg/util/downloader/commands"
 	"github.com/loft-sh/devspace/pkg/util/log"
-
-	"runtime"
-	"strings"
-)
-
-var (
-	helmVersion  = "v3.6.2"
-	helmDownload = "https://get.helm.sh/helm-" + helmVersion + "-" + runtime.GOOS + "-" + runtime.GOARCH
 )
 
 type client struct {
-	exec        command.Exec
-	kubeClient  kubectl.Client
 	genericHelm generic.Client
-
-	log log.Logger
 }
 
-// NewClient creates a new helm v3 client
-func NewClient(kubeClient kubectl.Client, log log.Logger) (types.Client, error) {
-	c := &client{
-		exec:       command.NewStreamCommand,
-		kubeClient: kubeClient,
-		log:        log,
-	}
-
-	c.genericHelm = generic.NewGenericClient(c, log)
+// NewClient creates a new helm v3 Client
+func NewClient(log log.Logger) (types.Client, error) {
+	c := &client{}
+	c.genericHelm = generic.NewGenericClient(commands.NewHelmV3Command(), log)
 	return c, nil
 }
 
-func (c *client) IsInCluster() bool {
-	return c.kubeClient.IsInCluster()
-}
-
-func (c *client) KubeContext() string {
-	return c.kubeClient.CurrentContext()
-}
-
-func (c *client) Command() string {
-	return "helm"
-}
-
-func (c *client) DownloadURL() string {
-	return helmDownload
-}
-
-func (c *client) IsValidHelm(path string) (bool, error) {
-	out, err := c.exec(path, []string{"version"}).Output()
-	if err != nil {
-		return false, nil
-	}
-
-	return strings.Contains(string(out), `:"v3.`), nil
-}
-
 // InstallChart installs the given chart via helm v3
-func (c *client) InstallChart(releaseName string, releaseNamespace string, values map[interface{}]interface{}, helmConfig *latest.HelmConfig) (*types.Release, error) {
+func (c *client) InstallChart(ctx devspacecontext.Context, releaseName string, releaseNamespace string, values map[string]interface{}, helmConfig *latest.HelmConfig) (*types.Release, error) {
 	valuesFile, err := c.genericHelm.WriteValues(values)
 	if err != nil {
 		return nil, err
@@ -76,68 +36,71 @@ func (c *client) InstallChart(releaseName string, releaseNamespace string, value
 	defer os.Remove(valuesFile)
 
 	if releaseNamespace == "" {
-		releaseNamespace = c.kubeClient.Namespace()
+		releaseNamespace = ctx.KubeClient().Namespace()
 	}
 
-	chartName, chartRepo := generic.ChartNameAndRepo(helmConfig)
 	args := []string{
 		"upgrade",
 		releaseName,
-		chartName,
-		"--namespace",
-		releaseNamespace,
 		"--values",
 		valuesFile,
 		"--install",
 	}
+	if releaseNamespace != "" {
+		args = append(args, "--namespace", releaseNamespace)
+	}
 
 	// Chart settings
-	if chartRepo != "" {
-		args = append(args, "--repo", chartRepo)
-		args = append(args, "--repository-config=''")
+	chartName := ""
+	if helmConfig.Chart.Source != nil {
+		chartName, err = dependencyutil.DownloadDependency(ctx.Context(), ctx.WorkingDir(), helmConfig.Chart.Source, ctx.Log())
+		if err != nil {
+			return nil, err
+		}
+
+		chartName = filepath.Dir(chartName)
+		args = append(args, chartName)
+	} else {
+		var chartRepo string
+		chartName, chartRepo = generic.ChartNameAndRepo(helmConfig)
+		args = append(args, chartName)
+		if chartRepo != "" {
+			args = append(args, "--repo", chartRepo)
+			args = append(args, "--repository-config=''")
+		}
+		if helmConfig.Chart.Version != "" {
+			args = append(args, "--version", helmConfig.Chart.Version)
+		}
+		if helmConfig.Chart.Username != "" {
+			args = append(args, "--username", helmConfig.Chart.Username)
+		}
+		if helmConfig.Chart.Password != "" {
+			args = append(args, "--password", helmConfig.Chart.Password)
+		}
 	}
-	if helmConfig.Chart.Version != "" {
-		args = append(args, "--version", helmConfig.Chart.Version)
-	}
-	if helmConfig.Chart.Username != "" {
-		args = append(args, "--username", helmConfig.Chart.Username)
-	}
-	if helmConfig.Chart.Password != "" {
-		args = append(args, "--password", helmConfig.Chart.Password)
+
+	// Update dependencies if needed
+	stat, err := os.Stat(chartName)
+	if err == nil && stat.IsDir() {
+		_, err := c.genericHelm.Exec(ctx.WithWorkingDir(chartName), []string{"dependency", "update"})
+		if err != nil {
+			ctx.Log().Warnf("error running helm dependency update: %v", err)
+		}
 	}
 
 	// Upgrade options
-	if helmConfig.Atomic {
-		args = append(args, "--atomic")
-	}
-	if helmConfig.CleanupOnFail {
-		args = append(args, "--cleanup-on-fail")
-	}
-	if helmConfig.Wait {
-		args = append(args, "--wait")
-	}
-	if helmConfig.Timeout != nil {
-		args = append(args, "--timeout", strconv.FormatInt(*helmConfig.Timeout, 10))
-	}
-	if helmConfig.Force {
-		args = append(args, "--force")
-	}
-	if helmConfig.DisableHooks {
-		args = append(args, "--no-hooks")
-	}
-
 	args = append(args, helmConfig.UpgradeArgs...)
-	output, err := c.genericHelm.Exec(args, helmConfig)
-
+	output, err := c.genericHelm.Exec(ctx, args)
 	if helmConfig.DisplayOutput {
-		c.log.Write(output)
+		writer := ctx.Log().Writer(logrus.InfoLevel, false)
+		_, _ = writer.Write(output)
+		_ = writer.Close()
 	}
-
 	if err != nil {
 		return nil, err
 	}
 
-	releases, err := c.ListReleases(helmConfig)
+	releases, err := c.ListReleases(ctx, releaseNamespace)
 	if err != nil {
 		return nil, err
 	}
@@ -151,35 +114,67 @@ func (c *client) InstallChart(releaseName string, releaseNamespace string, value
 	return nil, nil
 }
 
-func (c *client) Template(releaseName, releaseNamespace string, values map[interface{}]interface{}, helmConfig *latest.HelmConfig) (string, error) {
-	cleanup, chartDir, err := c.genericHelm.FetchChart(helmConfig)
-	if err != nil {
-		return "", err
-	} else if cleanup {
-		defer os.RemoveAll(filepath.Dir(chartDir))
-	}
-
-	if releaseNamespace == "" {
-		releaseNamespace = c.kubeClient.Namespace()
-	}
-
+func (c *client) Template(ctx devspacecontext.Context, releaseName, releaseNamespace string, values map[string]interface{}, helmConfig *latest.HelmConfig) (string, error) {
 	valuesFile, err := c.genericHelm.WriteValues(values)
 	if err != nil {
 		return "", err
 	}
 	defer os.Remove(valuesFile)
 
+	if releaseNamespace == "" {
+		releaseNamespace = ctx.KubeClient().Namespace()
+	}
+
 	args := []string{
 		"template",
 		releaseName,
-		chartDir,
-		"--namespace",
-		releaseNamespace,
 		"--values",
 		valuesFile,
 	}
+	if releaseNamespace != "" {
+		args = append(args, "--namespace", releaseNamespace)
+	}
+
+	// Chart settings
+	chartName := ""
+	if helmConfig.Chart.Source != nil {
+		chartName, err = dependencyutil.DownloadDependency(ctx.Context(), ctx.WorkingDir(), helmConfig.Chart.Source, ctx.Log())
+		if err != nil {
+			return "", err
+		}
+
+		chartName = filepath.Dir(chartName)
+		args = append(args, chartName)
+	} else {
+		var chartRepo string
+		chartName, chartRepo = generic.ChartNameAndRepo(helmConfig)
+		args = append(args, chartName)
+		if chartRepo != "" {
+			args = append(args, "--repo", chartRepo)
+			args = append(args, "--repository-config=''")
+		}
+		if helmConfig.Chart.Version != "" {
+			args = append(args, "--version", helmConfig.Chart.Version)
+		}
+		if helmConfig.Chart.Username != "" {
+			args = append(args, "--username", helmConfig.Chart.Username)
+		}
+		if helmConfig.Chart.Password != "" {
+			args = append(args, "--password", helmConfig.Chart.Password)
+		}
+	}
+
+	// Update dependencies if needed
+	stat, err := os.Stat(chartName)
+	if err == nil && stat.IsDir() {
+		_, err := c.genericHelm.Exec(ctx.WithWorkingDir(chartName), []string{"dependency", "update"})
+		if err != nil {
+			ctx.Log().Warnf("error running helm dependency update: %v", err)
+		}
+	}
+
 	args = append(args, helmConfig.TemplateArgs...)
-	result, err := c.genericHelm.Exec(args, helmConfig)
+	result, err := c.genericHelm.Exec(ctx, args)
 	if err != nil {
 		return "", err
 	}
@@ -187,19 +182,19 @@ func (c *client) Template(releaseName, releaseNamespace string, values map[inter
 	return string(result), nil
 }
 
-func (c *client) DeleteRelease(releaseName string, releaseNamespace string, helmConfig *latest.HelmConfig) error {
+func (c *client) DeleteRelease(ctx devspacecontext.Context, releaseName string, releaseNamespace string) error {
 	if releaseNamespace == "" {
-		releaseNamespace = c.kubeClient.Namespace()
+		releaseNamespace = ctx.KubeClient().Namespace()
 	}
 
 	args := []string{
 		"delete",
 		releaseName,
-		"--namespace",
-		releaseNamespace,
 	}
-	args = append(args, helmConfig.DeleteArgs...)
-	_, err := c.genericHelm.Exec(args, helmConfig)
+	if releaseNamespace != "" {
+		args = append(args, "--namespace", releaseNamespace)
+	}
+	_, err := c.genericHelm.Exec(ctx, args)
 	if err != nil {
 		return err
 	}
@@ -207,15 +202,19 @@ func (c *client) DeleteRelease(releaseName string, releaseNamespace string, helm
 	return nil
 }
 
-func (c *client) ListReleases(helmConfig *latest.HelmConfig) ([]*types.Release, error) {
+func (c *client) ListReleases(ctx devspacecontext.Context, namespace string) ([]*types.Release, error) {
 	args := []string{
 		"list",
-		"--namespace",
-		c.kubeClient.Namespace(),
+		"--max",
+		strconv.Itoa(0),
 		"--output",
 		"json",
 	}
-	out, err := c.genericHelm.Exec(args, helmConfig)
+	if namespace != "" {
+		args = append(args, "--namespace", namespace)
+	}
+
+	out, err := c.genericHelm.Exec(ctx, args)
 	if err != nil {
 		return nil, err
 	}

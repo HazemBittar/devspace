@@ -1,18 +1,14 @@
 package dockerfile
 
 import (
-	"io/ioutil"
-	"testing"
 	"os"
-	
+	"testing"
+
 	"gotest.tools/assert"
 )
 
 func TestGetPorts(t *testing.T) {
-	dir, err := ioutil.TempDir("", "testDeploy")
-	if err != nil {
-		t.Fatalf("Error creating temporary directory: %v", err)
-	}
+	dir := t.TempDir()
 
 	wdBackup, err := os.Getwd()
 	if err != nil {
@@ -28,10 +24,6 @@ func TestGetPorts(t *testing.T) {
 		err = os.Chdir(wdBackup)
 		if err != nil {
 			t.Fatalf("Error changing dir back: %v", err)
-		}
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Fatalf("Error removing dir: %v", err)
 		}
 	}()
 
@@ -56,6 +48,5 @@ EXPOSE `))
 	}
 	assert.Equal(t, 1, len(ports), "Wrong number of ports returned")
 	assert.Equal(t, 8080, ports[0], "Wrong port returned")
-
 
 }

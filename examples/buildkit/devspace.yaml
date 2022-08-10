@@ -1,25 +1,32 @@
-version: v1beta10
+version: v2beta1
+name: buildkit
+
+# Define an image to use
+vars:
+  IMAGE: myusername/devspace
+
+# Build the dockerfile with buildkit
 images:
-  default:
-    image: myusername/devspace
-    build:
-      buildKit: {}
+  my-image:
+    image: ${IMAGE}
+    buildKit: {}
+
+# Deploy the built image with helm and the component chart
 deployments:
-  - name: quickstart
+  my-deployment:
     helm:
-      componentChart: true
       values:
         containers:
-          - image: myusername/devspace
-        service:
-          ports:
-            - port: 3000
+          - image: ${IMAGE}
+
+# Is started after images were built and deployments deployed
 dev:
-  ports:
-    - imageName: default
-      forward:
-        - port: 3000
-  sync:
-    - imageName: default
+  my-dev:
+    imageSelector: ${IMAGE}
+    logs: {}
+    ports:
+    - port: 3000
+    sync:
+    - path: ./
       excludePaths:
         - node_modules

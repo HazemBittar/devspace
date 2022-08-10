@@ -2,63 +2,69 @@ package variable
 
 import (
 	"bytes"
+	"context"
+	"github.com/loft-sh/devspace/pkg/devspace/pipeline/engine"
+	"mvdan.cc/sh/v3/expand"
+	"os"
+	"strings"
+
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	"github.com/loft-sh/devspace/pkg/util/command"
-	"github.com/loft-sh/devspace/pkg/util/shell"
 	"github.com/pkg/errors"
-	"strings"
 )
 
 // NewCommandVariable creates a new variable that is loaded from a command
-func NewCommandVariable(name string) Variable {
+func NewCommandVariable(name, workingDirectory string) Variable {
 	return &commandVariable{
-		name: name,
+		name:             name,
+		workingDirectory: workingDirectory,
 	}
 }
 
 type commandVariable struct {
-	name string
+	name             string
+	workingDirectory string
 }
 
-func (c *commandVariable) Load(definition *latest.Variable) (interface{}, error) {
+func (c *commandVariable) Load(ctx context.Context, definition *latest.Variable) (interface{}, error) {
 	if definition.Command == "" && len(definition.Commands) == 0 {
 		return nil, errors.Errorf("couldn't set variable '%s', because source is '%s' but no command is specified", c.name, latest.VariableSourceCommand)
 	}
 
-	return variableFromCommand(c.name, definition)
+	return variableFromCommand(ctx, c.name, c.workingDirectory, definition)
 }
 
-func variableFromCommand(varName string, definition *latest.Variable) (interface{}, error) {
+func variableFromCommand(ctx context.Context, varName string, dir string, definition *latest.Variable) (interface{}, error) {
 	for _, c := range definition.Commands {
-		if command.ShouldExecuteOnOS(c.OperatingSystem) == false {
+		if !command.ShouldExecuteOnOS(c.OperatingSystem) {
 			continue
 		}
 
-		return execCommand(varName, definition, c.Command, c.Args)
+		return execCommand(ctx, varName, definition, c.Command, c.Args, dir)
 	}
 	if definition.Command == "" {
 		return nil, errors.Errorf("couldn't set variable '%s', because source is '%s' but no command for this operating system is specified", varName, latest.VariableSourceCommand)
 	}
 
-	return execCommand(varName, definition, definition.Command, definition.Args)
+	return execCommand(ctx, varName, definition, definition.Command, definition.Args, dir)
 }
 
-func execCommand(varName string, definition *latest.Variable, cmd string, args []string) (interface{}, error) {
+func execCommand(ctx context.Context, varName string, definition *latest.Variable, cmd string, args []string, dir string) (interface{}, error) {
 	writer := &bytes.Buffer{}
 	stdErrWriter := &bytes.Buffer{}
 	var err error
 	if args == nil {
-		err = shell.ExecuteShellCommand(cmd, nil, "", writer, stdErrWriter, nil)
+		err = engine.ExecuteSimpleShellCommand(ctx, dir, expand.ListEnviron(os.Environ()...), writer, stdErrWriter, nil, cmd)
 	} else {
-		err = command.ExecuteCommand(cmd, args, writer, stdErrWriter)
+		err = command.Command(ctx, dir, expand.ListEnviron(os.Environ()...), writer, stdErrWriter, nil, cmd, args...)
 	}
 	if err != nil {
-		errMsg := "fill variable " + varName + ": " + err.Error()
+		errMsg := "fill variable " + varName + " with command '" + cmd + "': " + err.Error()
 		if len(writer.Bytes()) > 0 {
-			errMsg = errMsg + "\n\nstdout: \n" + string(writer.Bytes())
+			errMsg = errMsg + "\n\nstdout: \n" + writer.String()
 		}
 		if len(stdErrWriter.Bytes()) > 0 {
-			errMsg = errMsg + "\n\nstderr: \n" + string(stdErrWriter.Bytes())
+			errMsg = errMsg + "\n\nstderr: \n" + stdErrWriter.String()
 		}
 
 		return "", errors.New(errMsg)

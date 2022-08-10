@@ -2,7 +2,6 @@ package docker
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,7 +10,7 @@ import (
 	configtypes "github.com/docker/cli/cli/config/types"
 	"github.com/docker/docker/api/types"
 	"github.com/loft-sh/devspace/pkg/util/fsutil"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 	"gotest.tools/assert"
 )
 
@@ -34,7 +33,7 @@ func TestGetAllAuthConfigs(t *testing.T) {
 			files: map[string]interface{}{
 				"config.json": configfile.ConfigFile{
 					AuthConfigs: map[string]configtypes.AuthConfig{
-						"key": configtypes.AuthConfig{
+						"key": {
 							Username:      "ValUser",
 							Password:      "ValPass",
 							Email:         "ValEmail",
@@ -46,7 +45,7 @@ func TestGetAllAuthConfigs(t *testing.T) {
 				},
 			},
 			expectedAuthConfigs: map[string]types.AuthConfig{
-				"key": types.AuthConfig{
+				"key": {
 					Username:      "ValUser",
 					Password:      "ValPass",
 					Email:         "ValEmail",
@@ -58,10 +57,7 @@ func TestGetAllAuthConfigs(t *testing.T) {
 		},
 	}
 
-	dir, err := ioutil.TempDir("", "test")
-	if err != nil {
-		t.Fatalf("Error creating temporary directory: %v", err)
-	}
+	dir := t.TempDir()
 
 	wdBackup, err := os.Getwd()
 	if err != nil {
@@ -80,10 +76,6 @@ func TestGetAllAuthConfigs(t *testing.T) {
 		err = os.Chdir(wdBackup)
 		if err != nil {
 			t.Fatalf("Error changing dir back: %v", err)
-		}
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Fatalf("Error removing dir: %v", err)
 		}
 	}()
 
@@ -111,7 +103,7 @@ func TestGetAllAuthConfigs(t *testing.T) {
 		authsAsYaml, err := yaml.Marshal(authconfigs)
 		assert.NilError(t, err, "Error parsing authConfigs to yaml in testCase %s", testCase.name)
 		expectedAsYaml, err := yaml.Marshal(testCase.expectedAuthConfigs)
-		assert.NilError(t, err, "Error parsing expection to yaml in testCase %s", testCase.name)
+		assert.NilError(t, err, "Error parsing exception to yaml in testCase %s", testCase.name)
 		assert.Equal(t, string(authsAsYaml), string(expectedAsYaml), "Unexpected authConfigs in testCase %s", testCase.name)
 
 		err = filepath.Walk(".", func(path string, f os.FileInfo, err error) error {

@@ -1,9 +1,10 @@
+//go:build !windows
 // +build !windows
 
 package sync
 
 import (
-	"github.com/loft-sh/devspace/pkg/util/log"
+	"context"
 	"io/ioutil"
 	"os"
 	"path"
@@ -14,38 +15,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/loft-sh/devspace/pkg/util/log"
+
 	"github.com/loft-sh/devspace/helper/server"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	"github.com/pkg/errors"
 )
 
 func initTestDirs(t *testing.T) (string, string, string) {
-	testRemotePath, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Couldn't create test dir: %v", err)
-	}
-
-	testLocalPath, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Couldn't create test dir: %v", err)
-	}
-
-	outside, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Couldn't create test dir: %v", err)
-	}
-
-	testRemotePath, err = filepath.EvalSymlinks(testRemotePath)
+	testRemotePath, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	testLocalPath, err = filepath.EvalSymlinks(testLocalPath)
+	testLocalPath, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	outside, err = filepath.EvalSymlinks(outside)
+	outside, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +42,7 @@ func initTestDirs(t *testing.T) (string, string, string) {
 }
 
 func createTestSyncClient(testLocalPath string, testCases testCaseList) (*Sync, error) {
-	sync, err := NewSync(testLocalPath, getSyncOptions(testCases))
+	sync, err := NewSync(context.Background(), testLocalPath, getSyncOptions(testCases))
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +101,7 @@ func TestInitialSync(t *testing.T) {
 				ExitOnClose:  false,
 			})
 			if err != nil {
-				t.Fatal(err)
+				panic(err)
 			}
 		}()
 
@@ -138,7 +126,7 @@ func TestInitialSync(t *testing.T) {
 				ExitOnClose: false,
 			})
 			if err != nil {
-				t.Fatal(err)
+				panic(err)
 			}
 		}()
 
@@ -202,7 +190,7 @@ func TestNormalSync(t *testing.T) {
 			ExitOnClose:  false,
 		})
 		if err != nil {
-			t.Fatal(err)
+			panic(err)
 		}
 	}()
 
@@ -227,10 +215,9 @@ func TestNormalSync(t *testing.T) {
 			ExitOnClose: false,
 		})
 		if err != nil {
-			t.Fatal(err)
+			panic(err)
 		}
 	}()
-
 	// Start upstream client
 	err = syncClient.InitUpstream(upClientReader, upServerWriter)
 	if err != nil {
@@ -421,7 +408,7 @@ func makeRemoveAndRenameTestCases(filesToCheck testCaseList, foldersToCheck test
 			}
 			array = append(array, renameEquivalent)
 
-			isFullyIncluded, _ := regexp.Compile("(testFolder\\/)?(testFile|testFolder)(Local|Remote)$")
+			isFullyIncluded, _ := regexp.Compile(`(testFolder\/)?(testFile|testFolder)(Local|Remote)$`)
 			if isFullyIncluded.MatchString(f.path) {
 				renameEquivalent = checkedFileOrFolder{
 					path:                f.path + "_RenameToOutside",
@@ -516,13 +503,13 @@ func makeRemoveAndRenameTestCases(filesToCheck testCaseList, foldersToCheck test
 func makeRemoteTestCases(testCases testCaseList) testCaseList {
 	for _, f := range testCases {
 		if strings.Contains(f.path, "Upload") {
-			f.path = strings.Replace(f.path, "Upload", "Download", -1)
-		} else if strings.Contains(f.path, "Download") {
-			f.path = strings.Replace(f.path, "Download", "Upload", -1)
+			f.path = strings.ReplaceAll(f.path, "Upload", "Download")
+		} else {
+			f.path = strings.ReplaceAll(f.path, "Download", "Upload")
 		}
 
 		remoteEquivalent := checkedFileOrFolder{
-			path:                strings.Replace(f.path, "Local", "Remote", -1),
+			path:                strings.ReplaceAll(f.path, "Local", "Remote"),
 			shouldExistInLocal:  f.shouldExistInRemote,
 			shouldExistInRemote: f.shouldExistInLocal,
 			editLocation:        editInRemote,

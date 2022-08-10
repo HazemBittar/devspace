@@ -1,15 +1,15 @@
 package testing
 
 import (
-	"fmt"
+	"context"
 
 	"github.com/loft-sh/devspace/pkg/devspace/config"
 	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
 
 	"github.com/ghodss/yaml"
 	"github.com/loft-sh/devspace/pkg/devspace/config/constants"
-	"github.com/loft-sh/devspace/pkg/devspace/config/generated"
 	"github.com/loft-sh/devspace/pkg/devspace/config/loader"
+	"github.com/loft-sh/devspace/pkg/devspace/config/localcache"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	"github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/pkg/errors"
@@ -18,12 +18,12 @@ import (
 // FakeConfigLoader is the fake config loader
 type FakeConfigLoader struct {
 	Config          *latest.Config
-	GeneratedConfig *generated.Config
+	GeneratedConfig *localcache.LocalCache
 	Log             log.Logger
 }
 
 // NewFakeConfigLoader creates a new config loader
-func NewFakeConfigLoader(generatedConfig *generated.Config, config *latest.Config, log log.Logger) loader.ConfigLoader {
+func NewFakeConfigLoader(generatedConfig *localcache.LocalCache, config *latest.Config, log log.Logger) loader.ConfigLoader {
 	return &FakeConfigLoader{
 		Config:          config,
 		GeneratedConfig: generatedConfig,
@@ -31,43 +31,26 @@ func NewFakeConfigLoader(generatedConfig *generated.Config, config *latest.Confi
 	}
 }
 
-// Exists implements interface
-func (f *FakeConfigLoader) Exists() bool {
-	return f.Config != nil
-}
-
 // Load implements interface
-func (f *FakeConfigLoader) Load(options *loader.ConfigOptions, log log.Logger) (config.Config, error) {
+func (f *FakeConfigLoader) Load(ctx context.Context, client kubectl.Client, options *loader.ConfigOptions, log log.Logger) (config.Config, error) {
 	if f.Config == nil {
 		return nil, errors.New("Couldn't load config")
 	}
 
-	return config.NewConfig(nil, f.Config, f.GeneratedConfig, nil, constants.DefaultConfigPath), nil
+	return config.NewConfig(nil, nil, f.Config, f.GeneratedConfig, nil, nil, constants.DefaultConfigPath), nil
 }
 
-func (f *FakeConfigLoader) ConfigPath() string {
-	return ""
+func (f *FakeConfigLoader) LoadWithCache(ctx context.Context, localCache localcache.Cache, client kubectl.Client, options *loader.ConfigOptions, log log.Logger) (config.Config, error) {
+	return nil, errors.New("Couldn't load config")
 }
 
-// LoadFromPath implements interface
-func (f *FakeConfigLoader) LoadFromPath(generatedConfig *generated.Config, path string) (*latest.Config, error) {
-	if f.Config == nil {
-		return nil, errors.New("Couldn't load config")
-	}
-
-	return f.Config, nil
-}
-
-func (f *FakeConfigLoader) RestoreLoadSave(client kubectl.Client) (*latest.Config, error) {
-	return f.Config, nil
-}
-
-func (f *FakeConfigLoader) LoadGenerated(options *loader.ConfigOptions) (*generated.Config, error) {
-	return f.GeneratedConfig, nil
+// ParseCommands implements interface
+func (f *FakeConfigLoader) LoadWithParser(ctx context.Context, localCache localcache.Cache, client kubectl.Client, parser loader.Parser, options *loader.ConfigOptions, log log.Logger) (config.Config, error) {
+	return nil, errors.New("Unsupported")
 }
 
 // LoadRaw implements interface
-func (f *FakeConfigLoader) LoadRaw() (map[interface{}]interface{}, error) {
+func (f *FakeConfigLoader) LoadRaw() (map[string]interface{}, error) {
 	if f.Config == nil {
 		return nil, errors.New("Couldn't load config")
 	}
@@ -77,7 +60,7 @@ func (f *FakeConfigLoader) LoadRaw() (map[interface{}]interface{}, error) {
 		return nil, err
 	}
 
-	retConfig := map[interface{}]interface{}{}
+	retConfig := map[string]interface{}{}
 	err = yaml.Unmarshal(out, &retConfig)
 	if err != nil {
 		return nil, err
@@ -86,33 +69,17 @@ func (f *FakeConfigLoader) LoadRaw() (map[interface{}]interface{}, error) {
 	return retConfig, nil
 }
 
-// GetProfiles implements interface
-func (f *FakeConfigLoader) LoadProfiles() ([]*latest.ProfileConfig, error) {
-	return f.Config.Profiles, nil
-}
-
-// ParseCommands implements interface
-func (f *FakeConfigLoader) LoadWithParser(parser loader.Parser, options *loader.ConfigOptions, log log.Logger) (config.Config, error) {
-	return nil, fmt.Errorf("Unsupported")
-}
-
-// Generated implements interface
-func (f *FakeConfigLoader) Generated() (*generated.Config, error) {
-	if f.GeneratedConfig == nil {
-		return nil, errors.New("Couldn't load config")
-	}
-
+func (f *FakeConfigLoader) LoadLocalCache() (localcache.Cache, error) {
 	return f.GeneratedConfig, nil
 }
 
-// SaveGenerated implements interface
-func (f *FakeConfigLoader) SaveGenerated(generatedConfig *generated.Config) error {
-	return nil
+// Exists implements interface
+func (f *FakeConfigLoader) Exists() bool {
+	return f.Config != nil
 }
 
-// Save implements interface
-func (f *FakeConfigLoader) Save(config *latest.Config) error {
-	return nil
+func (f *FakeConfigLoader) ConfigPath() string {
+	return ""
 }
 
 // SetDevSpaceRoot implements interface

@@ -1,15 +1,24 @@
 package cmd
 
 import (
+	"context"
+	"fmt"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
+	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
+	"github.com/loft-sh/devspace/pkg/devspace/kubectl/selector"
+	"github.com/loft-sh/devspace/pkg/devspace/services/terminal"
+	"io"
+	"strings"
+	"time"
+
 	"github.com/loft-sh/devspace/cmd/flags"
-	"github.com/loft-sh/devspace/pkg/devspace/config/generated"
+	"github.com/loft-sh/devspace/pkg/devspace/hook"
 	"github.com/loft-sh/devspace/pkg/devspace/plugin"
 	"github.com/loft-sh/devspace/pkg/devspace/services/targetselector"
 	"github.com/loft-sh/devspace/pkg/util/exit"
 	"github.com/loft-sh/devspace/pkg/util/factory"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"io"
 )
 
 // EnterCmd is a struct that defines a command call for "enter"
@@ -18,12 +27,13 @@ type EnterCmd struct {
 
 	LabelSelector string
 	ImageSelector string
-	Image         string
 	Container     string
 	Pod           string
 	Pick          bool
 	Wait          bool
-	Restart       bool
+	Reconnect     bool
+	Screen        bool
+	ScreenSession string
 
 	WorkingDirectory string
 
@@ -54,82 +64,101 @@ devspace enter -c my-container
 devspace enter bash -n my-namespace
 devspace enter bash -l release=test
 devspace enter bash --image-selector nginx:latest
-devspace enter bash --image-selector "image(app):tag(app)"
+devspace enter bash --image-selector "${runtime.images.app.image}:${runtime.images.app.tag}"
 #######################################################`,
 		RunE: func(cobraCmd *cobra.Command, args []string) error {
 			plugin.SetPluginCommand(cobraCmd, args)
-			return cmd.Run(f, cobraCmd, args)
+			return cmd.Run(f, args)
 		},
 	}
 
 	enterCmd.Flags().StringVarP(&cmd.Container, "container", "c", "", "Container name within pod where to execute command")
 	enterCmd.Flags().StringVar(&cmd.Pod, "pod", "", "Pod to open a shell to")
-	enterCmd.Flags().StringVar(&cmd.Image, "image", "", "Image is the config name of an image to select in the devspace config (e.g. 'default'), it is NOT a docker image like myuser/myimage")
 	enterCmd.Flags().StringVarP(&cmd.LabelSelector, "label-selector", "l", "", "Comma separated key=value selector list (e.g. release=test)")
-	enterCmd.Flags().StringVar(&cmd.ImageSelector, "image-selector", "", "The image to search a pod for (e.g. nginx, nginx:latest, image(app), nginx:tag(app))")
+	enterCmd.Flags().StringVar(&cmd.ImageSelector, "image-selector", "", "The image to search a pod for (e.g. nginx, nginx:latest, ${runtime.images.app}, nginx:${runtime.images.app.tag})")
 	enterCmd.Flags().StringVar(&cmd.WorkingDirectory, "workdir", "", "The working directory where to open the terminal or execute the command")
 
 	enterCmd.Flags().BoolVar(&cmd.Pick, "pick", true, "Select a pod / container if multiple are found")
 	enterCmd.Flags().BoolVar(&cmd.Wait, "wait", false, "Wait for the pod(s) to start if they are not running")
-	enterCmd.Flags().BoolVar(&cmd.Restart, "restart", false, "Will restart the terminal if a non zero return code is encountered")
+	enterCmd.Flags().BoolVar(&cmd.Reconnect, "reconnect", false, "Will reconnect the terminal if an unexpected return code is encountered")
+	enterCmd.Flags().BoolVar(&cmd.Screen, "screen", false, "Use a screen session to connect")
+	enterCmd.Flags().StringVar(&cmd.ScreenSession, "screen-session", "enter", "The screen session to create or connect to")
 
 	return enterCmd
 }
 
 // Run executes the command logic
-func (cmd *EnterCmd) Run(f factory.Factory, cobraCmd *cobra.Command, args []string) error {
+func (cmd *EnterCmd) Run(f factory.Factory, args []string) error {
 	// Set config root
 	logger := f.GetLog()
-	configOptions := cmd.ToConfigOptions(logger)
-	configLoader := f.NewConfigLoader(cmd.ConfigPath)
+	configOptions := cmd.ToConfigOptions()
+	configLoader, err := f.NewConfigLoader(cmd.ConfigPath)
+	if err != nil {
+		return err
+	}
 	configExists, err := configLoader.SetDevSpaceRoot(logger)
 	if err != nil {
 		return err
 	}
 
-	// Load config if possible
-	var generatedConfig *generated.Config
-	if configExists {
-		generatedConfig, err = configLoader.LoadGenerated(configOptions)
-		if err != nil {
-			return err
-		}
-		configOptions.GeneratedConfig = generatedConfig
-	}
-
-	// Use last context if specified
-	err = cmd.UseLastContext(generatedConfig, logger)
-	if err != nil {
-		return err
-	}
-
 	// Get kubectl client
-	client, err := f.NewKubeClientFromContext(cmd.KubeContext, cmd.Namespace, cmd.SwitchContext)
+	client, err := f.NewKubeClientFromContext(cmd.KubeContext, cmd.Namespace)
 	if err != nil {
 		return errors.Wrap(err, "new kube client")
 	}
 
+	// Load generated config if possible
+	if configExists {
+		localCache, err := configLoader.LoadLocalCache()
+		if err != nil {
+			return err
+		}
+
+		// If the current kube context or namespace is different than old,
+		// show warnings and reset kube client if necessary
+		client, err = kubectl.CheckKubeContext(client, localCache, cmd.NoWarn, cmd.SwitchContext, logger)
+		if err != nil {
+			return err
+		}
+	}
+
+	// create the context
+	ctx := devspacecontext.NewContext(context.Background(), nil, logger).WithKubeClient(client)
+
 	// Execute plugin hook
-	err = plugin.ExecutePluginHook("enter")
+	err = hook.ExecuteHooks(ctx, nil, "enter")
+	if err != nil {
+		return err
+	}
+
+	// get image selector if specified
+	imageSelector, err := getImageSelector(ctx, configLoader, configOptions, cmd.ImageSelector)
 	if err != nil {
 		return err
 	}
 
 	// Build params
-	selectorOptions := targetselector.NewOptionsFromFlags(cmd.Container, cmd.LabelSelector, cmd.Namespace, cmd.Pod, cmd.Pick)
-
-	// get image selector if specified
-	imageSelector, err := getImageSelector(client, configLoader, configOptions, cmd.Image, cmd.ImageSelector, logger)
-	if err != nil {
-		return err
+	selectorOptions := targetselector.NewOptionsFromFlags(cmd.Container, cmd.LabelSelector, imageSelector, cmd.Namespace, cmd.Pod).
+		WithPick(cmd.Pick).
+		WithWait(cmd.Wait).
+		WithQuestion("Which pod do you want to open the terminal for?")
+	if cmd.Wait {
+		selectorOptions = selectorOptions.WithContainerFilter(selector.FilterTerminatingContainers)
+		selectorOptions = selectorOptions.WithWaitingStrategy(targetselector.NewUntilNewestRunningWaitingStrategy(time.Second))
 	}
 
-	// set image selector
-	selectorOptions.ImageSelector = imageSelector
+	// build command
+	command := []string{"sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh"}
+	if len(args) > 0 {
+		command = args
+	}
+	if cmd.WorkingDirectory != "" {
+		command = []string{"sh", "-c", fmt.Sprintf("cd %s; %s", cmd.WorkingDirectory, strings.Join(command, " "))}
+	}
 
 	// Start terminal
 	stdout, stderr, stdin := defaultStdStreams(cmd.Stdout, cmd.Stderr, cmd.Stdin)
-	exitCode, err := f.NewServicesClient(nil, nil, client, logger).StartTerminal(selectorOptions, args, cmd.WorkingDirectory, make(chan error), cmd.Wait, cmd.Restart, stdout, stderr, stdin)
+	exitCode, err := terminal.StartTerminalFromCMD(ctx, targetselector.NewTargetSelector(selectorOptions), command, cmd.Wait, cmd.Reconnect, cmd.Screen, cmd.ScreenSession, stdout, stderr, stdin)
 	if err != nil {
 		return err
 	} else if exitCode != 0 {

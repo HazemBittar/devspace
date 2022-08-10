@@ -1,26 +1,24 @@
 package helper
 
 import (
-	"github.com/loft-sh/devspace/pkg/devspace/config"
-	"os"
-	"path/filepath"
-
 	"github.com/docker/cli/cli/command/image/build"
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/pkg/archive"
-	"github.com/loft-sh/devspace/pkg/devspace/config/generated"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
+	dockerclient "github.com/loft-sh/devspace/pkg/devspace/docker"
 	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
+	"github.com/loft-sh/devspace/pkg/util/command"
 	"github.com/loft-sh/devspace/pkg/util/hash"
-	"github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
+	"os"
 )
 
 // BuildHelper is the helper class to store common functionality used by both the docker and kaniko builder
 type BuildHelper struct {
 	ImageConfigName string
-	ImageConf       *latest.ImageConfig
-	Config          config.Config
+	ImageConf       *latest.Image
 
 	DockerfilePath string
 	ContextPath    string
@@ -30,19 +28,17 @@ type BuildHelper struct {
 	ImageTags  []string
 	Entrypoint []string
 	Cmd        []string
-
-	KubeClient kubectl.Client
 }
 
 // BuildHelperInterface is the interface the build helper uses to build an image
 type BuildHelperInterface interface {
-	BuildImage(absoluteContextPath string, absoluteDockerfilePath string, entrypoint []string, cmd []string, log log.Logger) error
+	BuildImage(ctx devspacecontext.Context, absoluteContextPath string, absoluteDockerfilePath string, entrypoint []string, cmd []string) error
 }
 
 // NewBuildHelper creates a new build helper for a certain engine
-func NewBuildHelper(config config.Config, kubeClient kubectl.Client, engineName string, imageConfigName string, imageConf *latest.ImageConfig, imageTags []string) *BuildHelper {
+func NewBuildHelper(ctx devspacecontext.Context, engineName string, imageConfigName string, imageConf *latest.Image, imageTags []string) *BuildHelper {
 	var (
-		dockerfilePath, contextPath = GetDockerfileAndContext(imageConf)
+		dockerfilePath, contextPath = GetDockerfileAndContext(ctx, imageConf)
 		imageName                   = imageConf.Image
 	)
 
@@ -72,45 +68,32 @@ func NewBuildHelper(config config.Config, kubeClient kubectl.Client, engineName 
 
 		Entrypoint: entrypoint,
 		Cmd:        cmd,
-		Config:     config,
-
-		KubeClient: kubeClient,
 	}
 }
 
 // Build builds a new image
-func (b *BuildHelper) Build(imageBuilder BuildHelperInterface, log log.Logger) error {
-	// Get absolute paths
-	absoluteDockerfilePath, err := filepath.Abs(b.DockerfilePath)
-	if err != nil {
-		return errors.Errorf("Couldn't determine absolute path for %s", b.DockerfilePath)
-	}
-
-	absoluteContextPath, err := filepath.Abs(b.ContextPath)
-	if err != nil {
-		return errors.Errorf("Couldn't determine absolute path for %s", b.ContextPath)
-	}
-
-	log.Infof("Building image '%s:%s' with engine '%s'", b.ImageName, b.ImageTags[0], b.EngineName)
+func (b *BuildHelper) Build(ctx devspacecontext.Context, imageBuilder BuildHelperInterface) error {
+	ctx.Log().Infof("Building image '%s:%s' with engine '%s'", b.ImageName, b.ImageTags[0], b.EngineName)
 
 	// Build Image
-	err = imageBuilder.BuildImage(absoluteContextPath, absoluteDockerfilePath, b.Entrypoint, b.Cmd, log)
+	err := imageBuilder.BuildImage(ctx, b.ContextPath, b.DockerfilePath, b.Entrypoint, b.Cmd)
 	if err != nil {
 		return err
 	}
 
-	log.Done("Done processing image '" + b.ImageName + "'")
+	ctx.Log().Done("Done processing image '" + b.ImageName + "'")
 	return nil
 }
 
 // ShouldRebuild determines if the image should be rebuilt
-func (b *BuildHelper) ShouldRebuild(cache *generated.CacheConfig, forceRebuild bool) (bool, error) {
+func (b *BuildHelper) ShouldRebuild(ctx devspacecontext.Context, forceRebuild bool) (bool, error) {
+	imageCache, _ := ctx.Config().LocalCache().GetImageCache(b.ImageConfigName)
+
 	// if rebuild strategy is always, we return here
 	if b.ImageConf.RebuildStrategy == latest.RebuildStrategyAlways {
+		ctx.Log().Infof("Rebuild image %s because strategy is always rebuild", imageCache.ImageName)
 		return true, nil
 	}
-
-	imageCache := cache.GetImageCache(b.ImageConfigName)
 
 	// Hash dockerfile
 	_, err := os.Stat(b.DockerfilePath)
@@ -148,11 +131,21 @@ func (b *BuildHelper) ShouldRebuild(cache *generated.CacheConfig, forceRebuild b
 
 	// only rebuild Docker image when Dockerfile or context has changed since latest build
 	mustRebuild := imageCache.Tag == "" || imageCache.DockerfileHash != dockerfileHash || imageCache.ImageConfigHash != imageConfigHash || imageCache.EntrypointHash != entrypointHash
+	if imageCache.Tag == "" {
+		ctx.Log().Infof("Rebuild image %s because tag is missing", imageCache.ImageName)
+	} else if imageCache.DockerfileHash != dockerfileHash {
+		ctx.Log().Infof("Rebuild image %s because dockerfile has changed", imageCache.ImageName)
+	} else if imageCache.ImageConfigHash != imageConfigHash {
+		ctx.Log().Infof("Rebuild image %s because image config has changed", imageCache.ImageName)
+	} else if imageCache.EntrypointHash != entrypointHash {
+		ctx.Log().Infof("Rebuild image %s because entrypoint has changed", imageCache.ImageName)
+	}
 
 	// Okay this check verifies if the previous deploy context was local kubernetes context where we didn't push the image and now have a kubernetes context where we probably push
 	// or use another docker client (e.g. minikube <-> docker-desktop)
-	if b.KubeClient != nil && cache.LastContext != nil && cache.LastContext.Context != b.KubeClient.CurrentContext() && kubectl.IsLocalKubernetes(cache.LastContext.Context) {
+	if !mustRebuild && ctx.KubeClient() != nil && ctx.Config().LocalCache().GetLastContext() != nil && ctx.Config().LocalCache().GetLastContext().Context != ctx.KubeClient().CurrentContext() && kubectl.IsLocalKubernetes(ctx.Config().LocalCache().GetLastContext().Context) {
 		mustRebuild = true
+		ctx.Log().Infof("Rebuild image %s because previous build was local kubernetes", imageCache.ImageName)
 	}
 
 	// Check if should consider context path changes for rebuilding
@@ -174,6 +167,9 @@ func (b *BuildHelper) ShouldRebuild(cache *generated.CacheConfig, forceRebuild b
 			return false, errors.Errorf("Error hashing %s: %v", contextDir, err)
 		}
 
+		if !mustRebuild && imageCache.ContextHash != contextHash {
+			ctx.Log().Infof("Rebuild image %s because build context has changed", imageCache.ImageName)
+		}
 		mustRebuild = mustRebuild || imageCache.ContextHash != contextHash
 
 		// TODO: This is not an ideal solution since there can be the issue that the user runs
@@ -192,5 +188,33 @@ func (b *BuildHelper) ShouldRebuild(cache *generated.CacheConfig, forceRebuild b
 		imageCache.EntrypointHash = entrypointHash
 	}
 
+	ctx.Config().LocalCache().SetImageCache(b.ImageConfigName, imageCache)
 	return mustRebuild, nil
+}
+
+func (b *BuildHelper) IsImageAvailableLocally(ctx devspacecontext.Context, dockerClient dockerclient.Client) (bool, error) {
+	// Hack to check if docker is present in the system
+	// if docker is not present then skip the image availability check
+	// and return (true, nil) to skip image rebuild
+	// if docker is present then do the image availability check
+	err := command.Command(ctx.Context(), ctx.WorkingDir(), ctx.Environ(), nil, nil, nil, "docker", "buildx")
+	if err != nil {
+		return true, nil
+	}
+
+	imageCache, _ := ctx.Config().LocalCache().GetImageCache(b.ImageConfigName)
+	imageName := imageCache.ImageName + ":" + imageCache.Tag
+	dockerAPIClient := dockerClient.DockerAPIClient()
+	imageList, err := dockerAPIClient.ImageList(ctx.Context(), types.ImageListOptions{})
+	if err != nil {
+		return false, err
+	}
+	for _, image := range imageList {
+		for _, repoTag := range image.RepoTags {
+			if repoTag == imageName {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }

@@ -2,10 +2,12 @@ package upgrade
 
 import (
 	"fmt"
-	"github.com/pkg/errors"
+	"github.com/loft-sh/devspace/pkg/devspace/env"
 	"os"
 	"regexp"
 	"sync"
+
+	"github.com/pkg/errors"
 
 	"github.com/loft-sh/devspace/pkg/util/log"
 
@@ -33,12 +35,12 @@ func eraseVersionPrefix(version string) (string, error) {
 }
 
 // PrintUpgradeMessage prints an upgrade message if there is a new version available
-func PrintUpgradeMessage() {
-	if os.Getenv("DEVSPACE_SKIP_VERSION_CHECK") != "true" {
+func PrintUpgradeMessage(log log.Logger) {
+	if env.GlobalGetEnv("DEVSPACE_SKIP_VERSION_CHECK") != "true" {
 		// Get version of current binary
 		latestVersion := NewerVersionAvailable()
 		if latestVersion != "" {
-			log.GetInstance().Warnf("There is a newer version of DevSpace: v%s. Run `devspace upgrade` to upgrade to the newest version.\n", latestVersion)
+			log.Warnf("There is a newer version of DevSpace: v%s. Run `devspace upgrade` to upgrade to the newest version.\n", latestVersion)
 		}
 	}
 }
@@ -136,9 +138,8 @@ func Upgrade(flagVersion string) error {
 			return err
 		}
 
-		log.StartWait(fmt.Sprintf("Downloading version %s...", flagVersion))
+		log.Info(fmt.Sprintf("Downloading version %s...", flagVersion))
 		err = selfupdate.DefaultUpdater().UpdateTo(release, cmdPath)
-		log.StopWait()
 		if err != nil {
 			return err
 		}
@@ -158,9 +159,8 @@ func Upgrade(flagVersion string) error {
 		return nil
 	}
 
-	log.StartWait("Downloading newest version...")
+	log.Info("Downloading newest version...")
 	latest, err := selfupdate.UpdateSelf(v, githubSlug)
-	log.StopWait()
 	if err != nil {
 		return err
 	}

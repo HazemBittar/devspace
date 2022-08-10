@@ -1,13 +1,12 @@
 package hook
 
 import (
-	"context"
-	"github.com/loft-sh/devspace/pkg/devspace/config"
-	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
-	"github.com/loft-sh/devspace/pkg/devspace/dependency/types"
-	"github.com/loft-sh/devspace/pkg/devspace/kubectl/selector"
-	logpkg "github.com/loft-sh/devspace/pkg/util/log"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
 	"io"
+
+	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
+	"github.com/loft-sh/devspace/pkg/devspace/kubectl/selector"
+	"github.com/mgutz/ansi"
 )
 
 func NewLogsHook(writer io.Writer) RemoteHook {
@@ -20,8 +19,9 @@ type remoteLogsHook struct {
 	Writer io.Writer
 }
 
-func (r *remoteLogsHook) ExecuteRemotely(ctx Context, hook *latest.HookConfig, podContainer *selector.SelectedPodContainer, config config.Config, dependencies []types.Dependency, log logpkg.Logger) error {
-	reader, err := ctx.Client.Logs(context.TODO(), podContainer.Pod.Namespace, podContainer.Pod.Name, podContainer.Container.Name, false, hook.Logs.TailLines, true)
+func (r *remoteLogsHook) ExecuteRemotely(ctx devspacecontext.Context, hook *latest.HookConfig, podContainer *selector.SelectedPodContainer) error {
+	ctx.Log().Infof("Execute hook '%s' in container '%s/%s/%s'", ansi.Color(hookName(hook), "white+b"), podContainer.Pod.Namespace, podContainer.Pod.Name, podContainer.Container.Name)
+	reader, err := ctx.KubeClient().Logs(ctx.Context(), podContainer.Pod.Namespace, podContainer.Pod.Name, podContainer.Container.Name, false, hook.Logs.TailLines, true)
 	if err != nil {
 		return err
 	}

@@ -18,9 +18,19 @@
 /__debug*
 .DS_STORE
 .idea
+.devspace/
 
 # VS Code
 .vscode/ipch
 
 /ui/node_modules
 /ui/build/static/js/*.js.map
+
+# Created by running unit tests ./hack/coverage.bash
+coverage.txt
+./main
+profile.out
+
+
+# Ignore DevSpace cache and log folder
+.devspace/

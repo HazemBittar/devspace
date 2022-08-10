@@ -2,8 +2,10 @@ package analyze
 
 import (
 	"fmt"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"github.com/sirupsen/logrus"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
 	"github.com/loft-sh/devspace/pkg/util/log"
@@ -64,15 +66,14 @@ func (a *analyzer) Analyze(namespace string, options Options) error {
 	}
 
 	reportString := ReportToString(report)
-	a.log.WriteString(reportString)
+	a.log.WriteString(logrus.InfoLevel, reportString)
 
 	return nil
 }
 
 // CreateReport creates a new report about a certain namespace
 func (a *analyzer) CreateReport(namespace string, options Options) ([]*ReportItem, error) {
-	a.log.StartWait("Checking status")
-	defer a.log.StopWait()
+	a.log.Info("Checking status...")
 
 	report := []*ReportItem{}
 	timeout := WaitTimeout
@@ -100,7 +101,7 @@ func (a *analyzer) CreateReport(namespace string, options Options) ([]*ReportIte
 		checkEvents := len(report) > 0
 
 		// Analyze replicasets
-		if checkEvents == false {
+		if !checkEvents {
 			replicaSetProblems, err := a.replicaSets(namespace)
 			if err != nil {
 				return false, errors.Errorf("Error during analyzing replica sets: %v", err)
@@ -111,7 +112,7 @@ func (a *analyzer) CreateReport(namespace string, options Options) ([]*ReportIte
 		}
 
 		// Analyze statefulsets
-		if checkEvents == false {
+		if !checkEvents {
 			statefulSetProblems, err := a.statefulSets(namespace)
 			if err != nil {
 				return false, errors.Errorf("Error during analyzing stateful sets: %v", err)
@@ -129,14 +130,14 @@ func (a *analyzer) CreateReport(namespace string, options Options) ([]*ReportIte
 			}
 			if len(problems) > 0 {
 				// Prepend to report
-				report = append([]*ReportItem{&ReportItem{
+				report = append([]*ReportItem{{
 					Name:     "Events",
 					Problems: problems,
 				}}, report...)
 			}
 		}
 
-		return len(report) == 0 || options.Wait == false || options.Patient == false, nil
+		return len(report) == 0 || !options.Wait || !options.Patient, nil
 	})
 	if err != nil && len(report) == 0 {
 		return nil, err

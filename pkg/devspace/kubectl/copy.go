@@ -3,10 +3,13 @@ package kubectl
 import (
 	"archive/tar"
 	"compress/gzip"
-	"github.com/loft-sh/devspace/helper/server/ignoreparser"
+	"context"
+	"github.com/loft-sh/devspace/pkg/util/log"
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/loft-sh/devspace/helper/server/ignoreparser"
 
 	"github.com/loft-sh/devspace/pkg/devspace/sync"
 
@@ -15,9 +18,10 @@ import (
 )
 
 // CopyFromReader extracts a tar from the reader to a container path
-func (client *client) CopyFromReader(pod *k8sv1.Pod, container, containerPath string, reader io.Reader) error {
-	_, stderr, err := client.ExecBuffered(pod, container, []string{"tar", "xzp", "-C", containerPath + "/."}, reader)
+func (client *client) CopyFromReader(ctx context.Context, pod *k8sv1.Pod, container, containerPath string, reader io.Reader) error {
+	_, stderr, err := client.ExecBuffered(ctx, pod, container, []string{"tar", "xzp", "-C", containerPath + "/."}, reader)
 	if err != nil {
+
 		if stderr != nil {
 			return errors.Errorf("error executing tar: %s: %v", string(stderr), err)
 		}
@@ -29,13 +33,13 @@ func (client *client) CopyFromReader(pod *k8sv1.Pod, container, containerPath st
 }
 
 // Copy copies the specified folder to the container
-func (client *client) Copy(pod *k8sv1.Pod, container, containerPath, localPath string, exclude []string) error {
+func (client *client) Copy(ctx context.Context, pod *k8sv1.Pod, container, containerPath, localPath string, exclude []string) error {
 	// do the actual copy
 	reader, writer := io.Pipe()
 	errorChan := make(chan error)
 	go func() {
 		defer reader.Close()
-		errorChan <- client.CopyFromReader(pod, container, containerPath, reader)
+		errorChan <- client.CopyFromReader(ctx, pod, container, containerPath, reader)
 	}()
 	go func() {
 		defer writer.Close()
@@ -60,7 +64,7 @@ func writeTar(writer io.Writer, localPath string, exclude []string) error {
 	}
 
 	// Compile ignore paths
-	ignoreMatcher, err := ignoreparser.CompilePaths(exclude)
+	ignoreMatcher, err := ignoreparser.CompilePaths(exclude, log.Discard)
 	if err != nil {
 		return errors.Wrap(err, "compile exclude paths")
 	}
@@ -74,7 +78,7 @@ func writeTar(writer io.Writer, localPath string, exclude []string) error {
 	defer tarWriter.Close()
 
 	// When its a file we copy the file to the toplevel of the tar
-	if stat.IsDir() == false {
+	if !stat.IsDir() {
 		return sync.NewArchiver(filepath.Dir(absolute), tarWriter, ignoreMatcher).AddToArchive(filepath.Base(absolute))
 	}
 

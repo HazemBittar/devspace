@@ -2,8 +2,6 @@ package server
 
 import (
 	"context"
-	"github.com/loft-sh/devspace/pkg/devspace/services"
-	"github.com/sirupsen/logrus"
 	"io"
 	"net/http"
 	"sync"
@@ -12,7 +10,6 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/loft-sh/devspace/pkg/devspace/kubectl"
 	"github.com/loft-sh/devspace/pkg/util/kubeconfig"
-	"github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/loft-sh/devspace/pkg/util/ptr"
 )
 
@@ -53,67 +50,16 @@ func (ws *wsStream) Read(p []byte) (int, error) {
 	return len(message), nil
 }
 
-func (h *handler) logsMultiple(w http.ResponseWriter, r *http.Request) {
-	// Kube Context
-	kubeContext := h.defaultContext
-	context, ok := r.URL.Query()["context"]
-	if ok && len(context) == 1 && context[0] != "" {
-		kubeContext = context[0]
-	}
-
-	// Namespace
-	kubeNamespace := h.defaultNamespace
-	namespace, ok := r.URL.Query()["namespace"]
-	if ok && len(namespace) == 1 && namespace[0] != "" {
-		kubeNamespace = namespace[0]
-	}
-
-	// Create kubectl client
-	client, err := h.getClientFromCache(kubeContext, kubeNamespace)
-	if err != nil {
-		h.log.Errorf("Error in %s: %v", r.URL.String(), err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		h.log.Errorf("Error upgrading connection in %s: %v", r.URL.String(), err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	defer ws.Close()
-
-	writer := &wsStream{WebSocket: ws}
-	manager, err := services.NewLogManager(client, h.config, h.dependencies, make(chan error), log.NewStreamLogger(writer, logrus.InfoLevel))
-	if err != nil {
-		h.log.Errorf("Error in %s: %v", r.URL.String(), err)
-		websocketError(ws, err)
-		return
-	}
-
-	err = manager.Start()
-	if err != nil {
-		h.log.Errorf("Error in %s: %v", r.URL.String(), err)
-		websocketError(ws, err)
-		return
-	}
-
-	ws.SetWriteDeadline(time.Now().Add(time.Second * 5))
-	ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-}
-
 func (h *handler) logs(w http.ResponseWriter, r *http.Request) {
 	// Kube Context
-	kubeContext := h.defaultContext
+	kubeContext := h.ctx.KubeClient().CurrentContext()
 	contextParam, ok := r.URL.Query()["context"]
 	if ok && len(contextParam) == 1 && contextParam[0] != "" {
 		kubeContext = contextParam[0]
 	}
 
 	// Namespace
-	kubeNamespace := h.defaultNamespace
+	kubeNamespace := h.ctx.KubeClient().Namespace()
 	namespace, ok := r.URL.Query()["namespace"]
 	if ok && len(namespace) == 1 && namespace[0] != "" {
 		kubeNamespace = namespace[0]
@@ -122,7 +68,7 @@ func (h *handler) logs(w http.ResponseWriter, r *http.Request) {
 	// Create kubectl client
 	client, err := kubectl.NewClientFromContext(kubeContext, kubeNamespace, false, kubeconfig.NewLoader())
 	if err != nil {
-		h.log.Errorf("Error in %s: %v", r.URL.String(), err)
+		h.ctx.Log().Errorf("Error in %s: %v", r.URL.String(), err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -140,7 +86,7 @@ func (h *handler) logs(w http.ResponseWriter, r *http.Request) {
 
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		h.log.Errorf("Error upgrading connection in %s: %v", r.URL.String(), err)
+		h.ctx.Log().Errorf("Error upgrading connection in %s: %v", r.URL.String(), err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -148,9 +94,9 @@ func (h *handler) logs(w http.ResponseWriter, r *http.Request) {
 	defer ws.Close()
 
 	// Open logs connection
-	reader, err := client.Logs(context.Background(), namespace[0], name[0], container[0], false, ptr.Int64(100), true)
+	reader, err := client.Logs(context.TODO(), namespace[0], name[0], container[0], false, ptr.Int64(100), true)
 	if err != nil {
-		h.log.Errorf("Error in %s: %v", r.URL.String(), err)
+		h.ctx.Log().Errorf("Error in %s: %v", r.URL.String(), err)
 		websocketError(ws, err)
 		return
 	}
@@ -161,11 +107,11 @@ func (h *handler) logs(w http.ResponseWriter, r *http.Request) {
 	stream := &wsStream{WebSocket: ws}
 	_, err = io.Copy(stream, reader)
 	if err != nil {
-		h.log.Errorf("Error in %s pipeReader: %v", r.URL.String(), err)
+		h.ctx.Log().Errorf("Error in %s pipeReader: %v", r.URL.String(), err)
 		websocketError(ws, err)
 		return
 	}
 
-	ws.SetWriteDeadline(time.Now().Add(time.Second * 5))
-	ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	_ = ws.SetWriteDeadline(time.Now().Add(time.Second * 5))
+	_ = ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 }

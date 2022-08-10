@@ -2,6 +2,10 @@ package testing
 
 import (
 	"fmt"
+	"io"
+	"io/ioutil"
+
+	"github.com/loft-sh/devspace/pkg/util/log"
 
 	"github.com/loft-sh/devspace/pkg/util/survey"
 	fakesurvey "github.com/loft-sh/devspace/pkg/util/survey/testing"
@@ -11,6 +15,7 @@ import (
 // FakeLogger just discards every log statement
 type FakeLogger struct {
 	Survey *fakesurvey.FakeSurvey
+	level  logrus.Level
 }
 
 // NewFakeLogger returns a new fake logger
@@ -89,10 +94,14 @@ func (d *FakeLogger) StartWait(message string) {}
 func (d *FakeLogger) StopWait() {}
 
 // SetLevel implements logger interface
-func (d *FakeLogger) SetLevel(level logrus.Level) {}
+func (d *FakeLogger) SetLevel(level logrus.Level) {
+	d.level = level
+}
 
 // GetLevel implements logger interface
-func (d *FakeLogger) GetLevel() logrus.Level { return logrus.FatalLevel }
+func (d *FakeLogger) GetLevel() logrus.Level {
+	return d.level
+}
 
 // Write implements logger interface
 func (d *FakeLogger) Write(message []byte) (int, error) {
@@ -100,9 +109,39 @@ func (d *FakeLogger) Write(message []byte) (int, error) {
 }
 
 // WriteString implements logger interface
-func (d *FakeLogger) WriteString(message string) {}
+func (d *FakeLogger) WriteString(level logrus.Level, message string) {}
 
 // Question asks a new question
 func (d *FakeLogger) Question(params *survey.QuestionOptions) (string, error) {
 	return d.Survey.Question(params)
+}
+
+func (d *FakeLogger) SetAnswer(answer string) {
+	d.Survey.SetNextAnswer(answer)
+}
+
+func (d *FakeLogger) Writer(level logrus.Level, raw bool) io.WriteCloser {
+	return log.WithNopCloser(ioutil.Discard)
+}
+
+func (d *FakeLogger) WithSink(log log.Logger) log.Logger {
+	return d
+}
+
+func (d *FakeLogger) WithLevel(level logrus.Level) log.Logger {
+	return d
+}
+
+func (d *FakeLogger) AddSink(log log.Logger) {}
+
+func (d *FakeLogger) WithPrefix(prefix string) log.Logger {
+	return d
+}
+
+func (d *FakeLogger) WithPrefixColor(prefix, color string) log.Logger {
+	return d
+}
+
+func (d *FakeLogger) ErrorStreamOnly() log.Logger {
+	return d
 }

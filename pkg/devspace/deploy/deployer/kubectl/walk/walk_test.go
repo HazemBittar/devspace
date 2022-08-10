@@ -3,7 +3,7 @@ package walk
 import (
 	"testing"
 
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 	"gotest.tools/assert"
 )
 
@@ -12,16 +12,16 @@ func TestWalk(t *testing.T) {
 	// Input yaml
 	input := `
 test:
-  image: appendtag
-  test: []
+    image: appendtag
+    test: []
 test2:
-  image: dontreplaceme
-  test3:
-  - test4:
-      test5:
-      image: replaceme
+    image: dontreplaceme
+    test3:
+    - test4:
+        test5:
+        image: replaceme
 `
-	inputObj := make(map[interface{}]interface{})
+	inputObj := make(map[string]interface{})
 	err := yaml.Unmarshal([]byte(input), inputObj)
 	if err != nil {
 		t.Fatalf("Error parsing input: %v", err)
@@ -30,7 +30,7 @@ test2:
 	match := MatchFn(func(key, value string) bool {
 		return key == "image" && value != "dontreplaceme"
 	})
-	replace := ReplaceFn(func(value string) (interface{}, error) {
+	replace := ReplaceFn(func(_, value string) (interface{}, error) {
 		if value == "appendtag" {
 			return "appendtag:test", nil
 		}
@@ -38,7 +38,7 @@ test2:
 		return "replaced", nil
 	})
 
-	Walk(inputObj, match, replace)
+	_ = Walk(inputObj, match, replace)
 
 	output, err := yaml.Marshal(inputObj)
 	if err != nil {
@@ -47,15 +47,14 @@ test2:
 
 	// Output yaml
 	expected := `test:
-  image: appendtag:test
-  test: []
+    image: appendtag:test
+    test: []
 test2:
-  image: dontreplaceme
-  test3:
-  - test4:
-      image: replaced
-      test5: null
+    image: dontreplaceme
+    test3:
+        - test4:
+            image: replaced
+            test5: null
 `
-
 	assert.Equal(t, string(output), expected)
 }

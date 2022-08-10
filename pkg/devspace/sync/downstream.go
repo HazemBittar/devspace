@@ -3,9 +3,12 @@ package sync
 import (
 	"context"
 	"fmt"
+	"github.com/loft-sh/devspace/helper/server/ignoreparser"
+	"github.com/loft-sh/devspace/pkg/util/fsutil"
 	"io"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,12 +21,13 @@ import (
 )
 
 type downstream struct {
-	interrupt chan bool
-	sync      *Sync
+	sync *Sync
 
 	reader io.ReadCloser
 	writer io.WriteCloser
 	client remote.DownstreamClient
+
+	ignoreMatcher ignoreparser.IgnoreParser
 
 	unarchiver *Unarchiver
 }
@@ -51,13 +55,19 @@ func newDownstream(reader io.ReadCloser, writer io.WriteCloser, sync *Sync) (*do
 		return nil, errors.Wrap(err, "new client connection")
 	}
 
+	// Create download exclude paths
+	ignoreMatcher, err := ignoreparser.CompilePaths(sync.Options.DownloadExcludePaths, sync.log)
+	if err != nil {
+		return nil, errors.Wrap(err, "compile paths")
+	}
+
 	return &downstream{
-		interrupt:  make(chan bool, 1),
-		sync:       sync,
-		reader:     reader,
-		writer:     writer,
-		client:     remote.NewDownstreamClient(conn),
-		unarchiver: NewUnarchiver(sync, false, sync.log),
+		sync:          sync,
+		reader:        reader,
+		writer:        writer,
+		client:        remote.NewDownstreamClient(conn),
+		ignoreMatcher: ignoreMatcher,
+		unarchiver:    NewUnarchiver(sync, false, sync.log),
 	}, nil
 }
 
@@ -65,7 +75,7 @@ func (d *downstream) populateFileMap() error {
 	d.sync.fileIndex.fileMapMutex.Lock()
 	defer d.sync.fileIndex.fileMapMutex.Unlock()
 
-	changes, err := d.collectChanges()
+	changes, err := d.collectChanges(true)
 	if err != nil {
 		return errors.Wrap(err, "collect changes")
 	}
@@ -79,9 +89,12 @@ func (d *downstream) populateFileMap() error {
 	return nil
 }
 
-func (d *downstream) collectChanges() ([]*remote.Change, error) {
+func (d *downstream) collectChanges(skipIgnore bool) ([]*remote.Change, error) {
+	d.sync.log.Debugf("Downstream - Start collecting changes")
+	defer d.sync.log.Debugf("Downstream - Done collecting changes")
+
 	changes := make([]*remote.Change, 0, 128)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*30)
+	ctx, cancel := context.WithTimeout(d.sync.ctx, time.Minute*30)
 	defer cancel()
 
 	// Create a change client and collect all changes
@@ -94,9 +107,14 @@ func (d *downstream) collectChanges() ([]*remote.Change, error) {
 		changeChunk, err := changesClient.Recv()
 		if changeChunk != nil {
 			for _, change := range changeChunk.Changes {
-				if d.shouldKeep(change) {
-					changes = append(changes, change)
+				if !skipIgnore && d.ignoreMatcher != nil && d.ignoreMatcher.Matches(change.Path, change.IsDir) {
+					continue
 				}
+				if !d.shouldKeep(change) {
+					continue
+				}
+
+				changes = append(changes, change)
 			}
 		}
 
@@ -116,13 +134,14 @@ func (d *downstream) startPing(doneChan chan struct{}) {
 			select {
 			case <-doneChan:
 				return
-			case <-time.After(time.Second * 20):
+			case <-time.After(time.Second * 15):
 				if d.client != nil {
-					ctx, cancel := context.WithTimeout(context.Background(), time.Second*20)
+					ctx, cancel := context.WithTimeout(d.sync.ctx, time.Second*20)
 					_, err := d.client.Ping(ctx, &remote.Empty{})
 					cancel()
 					if err != nil {
 						d.sync.Stop(fmt.Errorf("ping connection: %v", err))
+						return
 					}
 				}
 			}
@@ -131,15 +150,9 @@ func (d *downstream) startPing(doneChan chan struct{}) {
 }
 
 func (d *downstream) mainLoop() error {
-	doneChan := make(chan struct{})
-	defer close(doneChan)
-
-	// start pinging the underlying connection
-	d.startPing(doneChan)
-
 	lastAmountChanges := int64(0)
 	recheckInterval := 1700
-	if d.sync.Options.Polling == false {
+	if !d.sync.Options.Polling {
 		recheckInterval = 500
 	}
 
@@ -148,14 +161,14 @@ func (d *downstream) mainLoop() error {
 	)
 	for {
 		select {
-		case <-d.interrupt:
+		case <-d.sync.ctx.Done():
 			return nil
 		case <-time.After(time.Duration(recheckInterval) * time.Millisecond):
 			break
 		}
 
 		// Check for changes remotely
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute*10)
+		ctx, cancel := context.WithTimeout(d.sync.ctx, time.Minute*10)
 		changeAmount, err := d.client.ChangesCount(ctx, &remote.Empty{})
 		cancel()
 		if err != nil {
@@ -170,7 +183,7 @@ func (d *downstream) mainLoop() error {
 		// Compare change amount
 		if lastAmountChanges > 0 && (time.Now().After(changeTimer) || changeAmount.Amount > 25000 || changeAmount.Amount == lastAmountChanges) {
 			d.sync.fileIndex.fileMapMutex.Lock()
-			changes, err := d.collectChanges()
+			changes, err := d.collectChanges(false)
 			d.sync.fileIndex.fileMapMutex.Unlock()
 			if err != nil {
 				return errors.Wrap(err, "collect changes")
@@ -206,6 +219,9 @@ func (d *downstream) shouldKeep(change *remote.Change) bool {
 }
 
 func (d *downstream) applyChanges(changes []*remote.Change, force bool) error {
+	d.sync.log.Debugf("Downstream - Start applying %d changes", len(changes))
+	defer d.sync.log.Debugf("Downstream - Done applying changes")
+
 	var (
 		download = make([]*remote.Change, 0, len(changes)/2)
 		remove   = make([]*remote.Change, 0, len(changes)/2)
@@ -291,7 +307,7 @@ func (d *downstream) downloadFiles(writer io.WriteCloser, changes []*remote.Chan
 	defer writer.Close()
 
 	// cancel after 1 hour
-	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	ctx, cancel := context.WithTimeout(d.sync.ctx, time.Hour)
 	defer cancel()
 
 	// Print log message
@@ -396,7 +412,7 @@ func (d *downstream) remove(remove []*remote.Change, force bool) {
 			} else {
 				err := os.Remove(absFilepath)
 				if err != nil {
-					if os.IsNotExist(err) == false {
+					if !os.IsNotExist(err) {
 						d.sync.log.Infof("Downstream - Skip file delete '.%s': %v", change.Path, err)
 					}
 				}
@@ -420,8 +436,8 @@ func (d *downstream) deleteSafeRecursive(relativePath string, deleteChanges []*r
 	}
 
 	// We don't delete the folder or the contents if we haven't tracked it
-	if force == false {
-		if d.sync.fileIndex.fileMap[relativePath] == nil || found == false {
+	if !force {
+		if d.sync.fileIndex.fileMap[relativePath] == nil || !found {
 			d.sync.log.Infof("Downstream - Skip delete directory '.%s'", relativePath)
 			return
 		}
@@ -436,6 +452,10 @@ func (d *downstream) deleteSafeRecursive(relativePath string, deleteChanges []*r
 
 	// Loop over directory contents and check if we should delete the contents
 	for _, f := range files {
+		if fsutil.IsRecursiveSymlink(f, path.Join(relativePath, f.Name())) {
+			continue
+		}
+
 		childRelativePath := filepath.ToSlash(filepath.Join(relativePath, f.Name()))
 		childAbsFilepath := filepath.Join(d.sync.LocalPath, childRelativePath)
 		if shouldRemoveLocal(childAbsFilepath, d.sync.fileIndex.fileMap[childRelativePath], d.sync, force) {

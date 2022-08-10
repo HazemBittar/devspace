@@ -2,7 +2,10 @@ package use
 
 import (
 	"context"
+
 	"github.com/loft-sh/devspace/cmd/flags"
+	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/loft-sh/devspace/pkg/util/factory"
@@ -15,7 +18,8 @@ import (
 
 type namespaceCmd struct {
 	*flags.GlobalFlags
-	Reset bool
+	Reset  bool
+	Create bool
 }
 
 func newNamespaceCmd(f factory.Factory, globalFlags *flags.GlobalFlags) *cobra.Command {
@@ -28,7 +32,7 @@ func newNamespaceCmd(f factory.Factory, globalFlags *flags.GlobalFlags) *cobra.C
 #######################################################
 ############## devspace use namespace #################
 #######################################################
-Set the default namespace to deploy to
+Sets the default namespace to deploy to
 
 Example:
 devspace use namespace my-namespace
@@ -41,6 +45,7 @@ devspace use namespace my-namespace
 	}
 
 	useNamespace.Flags().BoolVar(&cmd.Reset, "reset", false, "Resets the default namespace of the current kube-context")
+	useNamespace.Flags().BoolVar(&cmd.Create, "create", false, "Create the namespace if it doesn't exist")
 
 	return useNamespace
 }
@@ -56,13 +61,6 @@ func (cmd *namespaceCmd) RunUseNamespace(f factory.Factory, cobraCmd *cobra.Comm
 
 	// Check if current kube context belongs to a space
 	kubeLoader := client.KubeConfigLoader()
-	isSpace, err := kubeLoader.IsCloudSpace(client.CurrentContext())
-	if err != nil {
-		return errors.Errorf("Unable to check if context belongs to Space: %v", err)
-	}
-	if isSpace {
-		return errors.Errorf("Current kube-context belongs to a Space created by DevSpace Cloud. Changing the default namespace for a Space context is not possible.")
-	}
 
 	// Load kube-config
 	kubeConfig, err := kubeLoader.LoadRawConfig()
@@ -80,6 +78,13 @@ func (cmd *namespaceCmd) RunUseNamespace(f factory.Factory, cobraCmd *cobra.Comm
 	namespace := ""
 	if len(args) > 0 {
 		namespace = args[0]
+		if cmd.Create {
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+			_, err := client.KubeClient().CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
+			if err != nil && !kerrors.IsAlreadyExists(err) {
+				return errors.Errorf("Unable to create namespace: %v", err)
+			}
+		}
 	} else if !cmd.Reset {
 		namespaceList, err := client.KubeClient().CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
@@ -116,7 +121,11 @@ func (cmd *namespaceCmd) RunUseNamespace(f factory.Factory, cobraCmd *cobra.Comm
 	}
 
 	// clear project kube context
-	err = ClearProjectKubeContext(f.NewConfigLoader(cmd.ConfigPath), cmd.ToConfigOptions(log), log)
+	configLoader, err := f.NewConfigLoader(cmd.ConfigPath)
+	if err != nil {
+		return err
+	}
+	err = ClearProjectKubeContext(configLoader, log)
 	if err != nil {
 		return errors.Wrap(err, "clear generated kube context")
 	}

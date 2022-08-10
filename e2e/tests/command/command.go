@@ -41,7 +41,7 @@ var _ = DevSpaceDescribe("command", func() {
 		// TODO
 	})
 
-	ginkgo.It("should and shouldnt append args", func() {
+	ginkgo.It("should and shouldn't append args", func() {
 		tempDir, err := framework.CopyToTempDir("tests/command/testdata/command-appended-args")
 		framework.ExpectNoError(err)
 		defer framework.CleanupTempDir(initialDir, tempDir)
@@ -52,7 +52,7 @@ var _ = DevSpaceDescribe("command", func() {
 			Stdout:      stdout,
 			Stderr:      stdout,
 		}
-		err = runCmd.RunRun(f, nil, []string{"test1", "test123", "test456"})
+		err = runCmd.RunRun(f, []string{"test1", "test123", "test456"})
 		framework.ExpectNoError(err)
 		framework.ExpectEqual(stdout.String(), "test123 test456")
 
@@ -62,7 +62,7 @@ var _ = DevSpaceDescribe("command", func() {
 			Stdout:      stdout,
 			Stderr:      stdout,
 		}
-		err = runCmd.RunRun(f, nil, []string{"test2", "test123", "test456"})
+		err = runCmd.RunRun(f, []string{"test2", "test123", "test456"})
 		framework.ExpectNoError(err)
 		framework.ExpectEqual(stdout.String(), "test123 test456")
 	})

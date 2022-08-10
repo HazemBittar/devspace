@@ -1,251 +1,156 @@
 package deploy
 
 import (
-	config2 "github.com/loft-sh/devspace/pkg/devspace/config"
-	"github.com/loft-sh/devspace/pkg/devspace/dependency/types"
-	"github.com/loft-sh/devspace/pkg/devspace/plugin"
+	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
+	"github.com/loft-sh/devspace/pkg/devspace/context/values"
 	"github.com/loft-sh/devspace/pkg/devspace/deploy/deployer"
 	"github.com/loft-sh/devspace/pkg/devspace/deploy/deployer/helm"
 	"github.com/loft-sh/devspace/pkg/devspace/deploy/deployer/kubectl"
 	helmclient "github.com/loft-sh/devspace/pkg/devspace/helm"
-	helmtypes "github.com/loft-sh/devspace/pkg/devspace/helm/types"
 	"github.com/loft-sh/devspace/pkg/devspace/hook"
 	kubectlclient "github.com/loft-sh/devspace/pkg/devspace/kubectl"
-	kubectlpkg "github.com/loft-sh/devspace/pkg/devspace/kubectl"
-	"github.com/loft-sh/devspace/pkg/util/log"
-
+	"github.com/mgutz/ansi"
 	"github.com/pkg/errors"
 )
 
 // Options describe how the deployments should be deployed
 type Options struct {
-	IsDev       bool
-	ForceDeploy bool
-	BuiltImages map[string]string
-	Deployments []string
+	SkipDeploy  bool `long:"skip" description:"If enabled, will skip deploying"`
+	ForceDeploy bool `long:"force-redeploy" description:"Forces redeployment"`
+	Sequential  bool `long:"sequential" description:"Sequentially deploys the deployments"`
+
+	Render       bool `long:"render" description:"If true, prints the rendered manifests to the stdout instead of deploying them"`
+	RenderWriter io.Writer
+}
+
+type PurgeOptions struct {
+	ForcePurge bool `long:"force-purge" description:"Forces purging of deployments even though they might be still in use by other DevSpace projects"`
 }
 
 // Controller is the main deploying interface
 type Controller interface {
-	Deploy(options *Options, log log.Logger) error
-	Render(options *Options, out io.Writer, log log.Logger) error
-	Purge(deployments []string, log log.Logger) error
+	Deploy(ctx devspacecontext.Context, deployments []string, options *Options) error
+	Purge(ctx devspacecontext.Context, deployments []string, options *PurgeOptions) error
 }
 
-type controller struct {
-	config       config2.Config
-	dependencies []types.Dependency
-
-	hookExecuter hook.Executer
-	client       kubectlclient.Client
-}
+type controller struct{}
 
 // NewController creates a new image build controller
-func NewController(config config2.Config, dependencies []types.Dependency, client kubectlclient.Client) Controller {
-	config = config2.Ensure(config)
-	return &controller{
-		config:       config,
-		dependencies: dependencies,
-
-		hookExecuter: hook.NewExecuter(config, dependencies),
-		client:       client,
-	}
-}
-
-func (c *controller) Render(options *Options, out io.Writer, log log.Logger) error {
-	config := c.config.Config()
-	if config.Deployments != nil && len(config.Deployments) > 0 {
-		helmV2Clients := map[string]helmtypes.Client{}
-
-		for _, deployConfig := range config.Deployments {
-			if len(options.Deployments) > 0 {
-				shouldSkip := true
-
-				for _, deployment := range options.Deployments {
-					if deployment == strings.TrimSpace(deployConfig.Name) {
-						shouldSkip = false
-						break
-					}
-				}
-
-				if shouldSkip {
-					continue
-				}
-			}
-
-			deployClient, err := c.getDeployClient(deployConfig, helmV2Clients, log)
-			if err != nil {
-				return err
-			}
-
-			pluginErr := plugin.ExecutePluginHookWithContext("deploy.beforeRender", map[string]interface{}{
-				"DEPLOY_CONFIG": deployConfig,
-			})
-			if pluginErr != nil {
-				return pluginErr
-			}
-
-			err = deployClient.Render(options.BuiltImages, out)
-			if err != nil {
-				pluginErr := plugin.ExecutePluginHookWithContext("deploy.errorRender", map[string]interface{}{
-					"DEPLOY_CONFIG": deployConfig,
-					"ERROR":         err,
-				})
-				if pluginErr != nil {
-					return pluginErr
-				}
-
-				return errors.Errorf("error deploying %s: %v", deployConfig.Name, err)
-			}
-
-			pluginErr = plugin.ExecutePluginHookWithContext("deploy.afterRender", map[string]interface{}{
-				"DEPLOY_CONFIG": deployConfig,
-			})
-			if pluginErr != nil {
-				return pluginErr
-			}
-		}
-	}
-
-	return nil
-}
-
-func (c *controller) getDeployClient(deployConfig *latest.DeploymentConfig, helmV2Clients map[string]helmtypes.Client, log log.Logger) (deployer.Interface, error) {
-	var (
-		deployClient deployer.Interface
-		err          error
-	)
-	if deployConfig.Kubectl != nil {
-		deployClient, err = kubectl.New(c.config, c.dependencies, c.client, deployConfig, log)
-		if err != nil {
-			return nil, errors.Errorf("error render: deployment %s error: %v", deployConfig.Name, err)
-		}
-
-	} else if deployConfig.Helm != nil {
-		// Get helm client
-		helmClient, err := GetCachedHelmClient(c.config.Config(), deployConfig, c.client, helmV2Clients, true, log)
-		if err != nil {
-			return nil, errors.Wrap(err, "get cached helm client")
-		}
-
-		deployClient, err = helm.New(c.config, c.dependencies, helmClient, c.client, deployConfig, log)
-		if err != nil {
-			return nil, errors.Errorf("error render: deployment %s error: %v", deployConfig.Name, err)
-		}
-	} else {
-		return nil, errors.Errorf("error render: deployment %s has no deployment method", deployConfig.Name)
-	}
-	return deployClient, nil
+func NewController() Controller {
+	return &controller{}
 }
 
 // Deploy deploys all deployments in the config
-func (c *controller) Deploy(options *Options, log log.Logger) error {
-	config := c.config.Config()
-	if config.Deployments != nil && len(config.Deployments) > 0 {
-		helmV2Clients := map[string]helmtypes.Client{}
+func (c *controller) Deploy(ctx devspacecontext.Context, deployments []string, options *Options) error {
+	config := ctx.Config().Config()
+	event := "deploy"
+	if options.Render {
+		event = "render"
+	}
 
+	if options.SkipDeploy {
+		ctx.Log().Debugf("Skip deploy because of --skip-deploy")
+		return nil
+	}
+
+	if config.Deployments != nil && len(config.Deployments) > 0 {
 		// Execute before deployments deploy hook
-		err := c.hookExecuter.Execute(hook.Before, hook.StageDeployments, hook.All, hook.Context{Client: c.client}, log)
+		err := hook.ExecuteHooks(ctx, nil, "before:"+event)
 		if err != nil {
 			return err
 		}
 
-		for _, deployConfig := range config.Deployments {
-			if len(options.Deployments) > 0 {
-				shouldSkip := true
-
-				for _, deployment := range options.Deployments {
-					if deployment == strings.TrimSpace(deployConfig.Name) {
-						shouldSkip = false
-						break
-					}
-				}
-
-				if shouldSkip {
-					continue
+		// get relevant deployments
+		var (
+			concurrentDeployments []*latest.DeploymentConfig
+			sequentialDeployments []*latest.DeploymentConfig
+		)
+		if len(deployments) == 0 {
+			for _, deployConfig := range config.Deployments {
+				if !options.Render && !options.Sequential {
+					concurrentDeployments = append(concurrentDeployments, deployConfig)
+				} else {
+					sequentialDeployments = append(sequentialDeployments, deployConfig)
 				}
 			}
 
-			var (
-				deployClient deployer.Interface
-				err          error
-				method       string
-			)
-
-			if deployConfig.Kubectl != nil {
-				deployClient, err = kubectl.New(c.config, c.dependencies, c.client, deployConfig, log)
-				if err != nil {
-					return errors.Errorf("error deploying: deployment %s error: %v", deployConfig.Name, err)
-				}
-
-				method = "kubectl"
-			} else if deployConfig.Helm != nil {
-				// Get helm client
-				helmClient, err := GetCachedHelmClient(c.config.Config(), deployConfig, c.client, helmV2Clients, false, log)
-				if err != nil {
-					return err
-				}
-
-				deployClient, err = helm.New(c.config, c.dependencies, helmClient, c.client, deployConfig, log)
-				if err != nil {
-					return errors.Errorf("error deploying: deployment %s error: %v", deployConfig.Name, err)
-				}
-
-				method = "helm"
-			} else {
-				return errors.Errorf("error deploying: deployment %s has no deployment method", deployConfig.Name)
-			}
-
-			// Execute before deployment deploy hook
-			err = c.hookExecuter.Execute(hook.Before, hook.StageDeployments, deployConfig.Name, hook.Context{Client: c.client}, log)
-			if err != nil {
-				return err
-			}
-			pluginErr := plugin.ExecutePluginHookWithContext("deploy.beforeDeploy", map[string]interface{}{
-				"DEPLOY_CONFIG": deployConfig,
+			// make sure --all behaves the same every rung
+			sort.Slice(concurrentDeployments, func(i, j int) bool {
+				return concurrentDeployments[i].Name < concurrentDeployments[j].Name
 			})
-			if pluginErr != nil {
-				return pluginErr
+			sort.Slice(sequentialDeployments, func(i, j int) bool {
+				return sequentialDeployments[i].Name < sequentialDeployments[j].Name
+			})
+		} else {
+			deploymentMap := config.Deployments
+			if deploymentMap == nil {
+				deploymentMap = map[string]*latest.DeploymentConfig{}
 			}
 
-			wasDeployed, err := deployClient.Deploy(options.ForceDeploy, options.BuiltImages)
-			if err != nil {
-				c.hookExecuter.OnError(hook.StageDeployments, []string{hook.All, deployConfig.Name}, hook.Context{Client: c.client, Error: err}, log)
-				pluginErr := plugin.ExecutePluginHookWithContext("deploy.errorDeploy", map[string]interface{}{
-					"DEPLOY_CONFIG": deployConfig,
-					"ERROR":         err,
-				})
-				if pluginErr != nil {
-					return pluginErr
+			for _, deployment := range deployments {
+				deployConfig, ok := deploymentMap[deployment]
+				if !ok {
+					return fmt.Errorf("couldn't find deployment %v", deployment)
 				}
-				return errors.Errorf("error deploying %s: %v", deployConfig.Name, err)
-			}
 
-			if wasDeployed {
-				log.Donef("Successfully deployed %s with %s", deployConfig.Name, method)
-
-				// Execute after deployment deploy hook
-				err = c.hookExecuter.Execute(hook.After, hook.StageDeployments, deployConfig.Name, hook.Context{Client: c.client}, log)
-				if err != nil {
-					return err
+				if !options.Render && !options.Sequential {
+					concurrentDeployments = append(concurrentDeployments, deployConfig)
+				} else {
+					sequentialDeployments = append(sequentialDeployments, deployConfig)
 				}
-				pluginErr := plugin.ExecutePluginHookWithContext("deploy.afterDeploy", map[string]interface{}{
-					"DEPLOY_CONFIG": deployConfig,
-				})
-				if pluginErr != nil {
-					return pluginErr
-				}
-			} else {
-				log.Infof("Skipping deployment %s", deployConfig.Name)
 			}
 		}
 
+		var (
+			errChan      = make(chan error)
+			deployedChan = make(chan bool)
+		)
+		for i, deployConfig := range concurrentDeployments {
+			go func(deployConfig *latest.DeploymentConfig, deployNumber int) {
+				wasDeployed, err := c.deployOne(ctx.WithLogger(ctx.Log().WithPrefix("deploy:"+deployConfig.Name+" ")), deployConfig, options)
+				if err != nil {
+					errChan <- err
+				} else {
+					deployedChan <- wasDeployed
+				}
+			}(deployConfig, i)
+		}
+
+		if len(concurrentDeployments) > 0 {
+			ctx.Log().Debugf("Deploying %d deployments concurrently...", len(concurrentDeployments))
+
+			// Wait for concurrent deployments to complete before starting sequential deployments.
+			for i := 0; i < len(concurrentDeployments); i++ {
+				select {
+				case err := <-errChan:
+					return err
+				case <-deployedChan:
+					ctx.Log().Debugf("Deploying %d deployments concurrently", len(concurrentDeployments)-i-1)
+				}
+			}
+		}
+
+		for _, deployConfig := range sequentialDeployments {
+			logsDeploy := ctx.Log().WithPrefix("deploy:" + deployConfig.Name + " ")
+			_, err := c.deployOne(ctx.WithLogger(logsDeploy), deployConfig, options)
+			if err != nil {
+				return err
+			}
+		}
+
+		err = ctx.Config().RemoteCache().Save(ctx.Context(), ctx.KubeClient())
+		if err != nil {
+			return err
+		}
+
 		// Execute after deployments deploy hook
-		err = c.hookExecuter.Execute(hook.After, hook.StageDeployments, hook.All, hook.Context{Client: c.client}, log)
+		err = hook.ExecuteHooks(ctx, nil, "after:"+event)
 		if err != nil {
 			return err
 		}
@@ -254,156 +159,217 @@ func (c *controller) Deploy(options *Options, log log.Logger) error {
 	return nil
 }
 
+func (c *controller) deployOne(ctx devspacecontext.Context, deployConfig *latest.DeploymentConfig, options *Options) (bool, error) {
+	event := "deploy"
+	if options.Render {
+		event = "render"
+	}
+
+	var (
+		deployClient deployer.Interface
+		err          error
+		method       string
+	)
+
+	if !options.Render && deployConfig.Namespace != "" {
+		err = kubectlclient.EnsureNamespace(ctx.Context(), ctx.KubeClient(), deployConfig.Namespace, ctx.Log())
+		if err != nil {
+			return false, err
+		}
+	}
+
+	if deployConfig.Kubectl != nil {
+		deployClient, err = kubectl.New(ctx, deployConfig)
+		if err != nil {
+			return true, errors.Errorf("error deploying: deployment %s error: %v", deployConfig.Name, err)
+		}
+
+		method = "kubectl"
+	} else if deployConfig.Helm != nil {
+		// Get helm client
+		helmClient, err := helmclient.NewClient(ctx.Log())
+		if err != nil {
+			return true, err
+		}
+
+		deployClient, err = helm.New(helmClient, deployConfig)
+		if err != nil {
+			return true, errors.Errorf("error deploying: deployment %s error: %v", deployConfig.Name, err)
+		}
+
+		method = "helm"
+	} else {
+		return true, errors.Errorf("error deploying: deployment %s has no deployment method", deployConfig.Name)
+	}
+	// Execute before deployment deploy hook
+	err = hook.ExecuteHooks(ctx, map[string]interface{}{
+		"DEPLOY_NAME":   deployConfig.Name,
+		"DEPLOY_CONFIG": deployConfig,
+	}, hook.EventsForSingle("before:"+event, deployConfig.Name)...)
+	if err != nil {
+		return true, err
+	}
+
+	wasDeployed := false
+	if !options.Render {
+		wasDeployed, err = deployClient.Deploy(ctx, options.ForceDeploy)
+	} else {
+		err = deployClient.Render(ctx, options.RenderWriter)
+	}
+	if err != nil {
+		hookErr := hook.ExecuteHooks(ctx, map[string]interface{}{
+			"DEPLOY_NAME":   deployConfig.Name,
+			"DEPLOY_CONFIG": deployConfig,
+			"ERROR":         err,
+		}, hook.EventsForSingle("error:"+event, deployConfig.Name)...)
+		if hookErr != nil {
+			return true, hookErr
+		}
+
+		return true, errors.Errorf("error deploying %s: %v", deployConfig.Name, err)
+	}
+
+	if wasDeployed {
+		ctx.Log().Donef("Successfully deployed %s with %s", ansi.Color(deployConfig.Name, "white+b"), ansi.Color(method, "white+b"))
+		// Execute after deployment deploy hook
+		err = hook.ExecuteHooks(ctx, map[string]interface{}{
+			"DEPLOY_NAME":   deployConfig.Name,
+			"DEPLOY_CONFIG": deployConfig,
+		}, hook.EventsForSingle("after:"+event, deployConfig.Name)...)
+		if err != nil {
+			return true, err
+		}
+	} else if !options.Render {
+		ctx.Log().Infof("Skipping deployment %s", deployConfig.Name)
+		// Execute skip deploy hook
+		err = hook.ExecuteHooks(ctx, map[string]interface{}{
+			"DEPLOY_NAME":   deployConfig.Name,
+			"DEPLOY_CONFIG": deployConfig,
+		}, hook.EventsForSingle("skip:"+event, deployConfig.Name)...)
+		if err != nil {
+			return true, err
+		}
+	}
+	return false, nil
+}
+
 // Purge removes all deployments or a set of deployments from the cluster
-func (c *controller) Purge(deployments []string, log log.Logger) error {
+func (c *controller) Purge(ctx devspacecontext.Context, deployments []string, options *PurgeOptions) error {
+	if options == nil {
+		options = &PurgeOptions{}
+	}
 	if deployments != nil && len(deployments) == 0 {
 		deployments = nil
 	}
 
-	config := c.config.Config()
-	if config.Deployments != nil {
-		helmV2Clients := map[string]helmtypes.Client{}
+	// Execute before deployments purge hook
+	err := hook.ExecuteHooks(ctx, nil, "before:purge")
+	if err != nil {
+		return err
+	}
 
-		// Execute before deployments purge hook
-		err := c.hookExecuter.Execute(hook.Before, hook.StagePurgeDeployments, hook.All, hook.Context{Client: c.client}, log)
+	// Check if root name is defined
+	rootName, ok := values.RootNameFrom(ctx.Context())
+	if !ok {
+		options.ForcePurge = true
+	}
+
+	// Reverse them
+	deploymentCaches := ctx.Config().RemoteCache().ListDeployments()
+	for i := len(deploymentCaches) - 1; i >= 0; i-- {
+		// Deployment cache
+		deploymentCache := deploymentCaches[i]
+
+		// Check if we should skip deleting deployment
+		if deployments != nil {
+			found := false
+			for _, value := range deployments {
+				if value == deploymentCache.Name {
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				continue
+			}
+		}
+		ctx := ctx.WithLogger(ctx.Log().WithPrefix("purge:" + deploymentCache.Name + " "))
+
+		// Execute before deployment purge hook
+		err = hook.ExecuteHooks(ctx, map[string]interface{}{
+			"DEPLOY_NAME":   deploymentCache.Name,
+			"DEPLOY_CONFIG": deploymentCache,
+		}, hook.EventsForSingle("before:purge", deploymentCache.Name).With("deploy.beforePurge")...)
 		if err != nil {
 			return err
 		}
 
-		// Reverse them
-		for i := len(config.Deployments) - 1; i >= 0; i-- {
-			var (
-				err          error
-				deployClient deployer.Interface
-				deployConfig = config.Deployments[i]
-			)
-
-			// Check if we should skip deleting deployment
-			if deployments != nil {
-				found := false
-
-				for _, value := range deployments {
-					if value == deployConfig.Name {
-						found = true
-						break
-					}
-				}
-
-				if found == false {
+		// Check if we should skip deletion
+		if !options.ForcePurge && len(deploymentCache.Projects) > 0 && (len(deploymentCache.Projects) > 1 || deploymentCache.Projects[0] != rootName) {
+			newProjects := []string{}
+			for _, p := range deploymentCache.Projects {
+				if p == rootName {
 					continue
 				}
+
+				newProjects = append(newProjects, p)
 			}
 
-			// Delete kubectl engine
-			if deployConfig.Kubectl != nil {
-				deployClient, err = kubectl.New(c.config, c.dependencies, c.client, deployConfig, log)
-				if err != nil {
-					return errors.Wrap(err, "create kube client")
-				}
-			} else if deployConfig.Helm != nil {
-				helmClient, err := GetCachedHelmClient(c.config.Config(), deployConfig, c.client, helmV2Clients, false, log)
-				if err != nil {
-					return errors.Wrap(err, "get cached helm client")
-				}
+			deploymentCache.Projects = newProjects
+			ctx.Log().Infof("Skip purging deployment %s as it is still in use by other DevSpace project(s) '%s'. Run with '--force-purge' to force deletion", deploymentCache.Name, strings.Join(deploymentCache.Projects, "', '"))
+			ctx.Config().RemoteCache().SetDeployment(deploymentCache.Name, deploymentCache)
+			continue
+		}
 
-				deployClient, err = helm.New(c.config, c.dependencies, helmClient, c.client, deployConfig, log)
-				if err != nil {
-					return errors.Wrap(err, "create helm client")
-				}
-			} else {
-				return errors.Errorf("error purging: deployment %s has no deployment method", deployConfig.Name)
+		// Delete kubectl engine
+		ctx.Log().Info("Deleting deployment " + deploymentCache.Name + "...")
+		if deploymentCache.Kubectl != nil {
+			err = kubectl.Delete(ctx, deploymentCache.Name)
+		} else if deploymentCache.Helm != nil {
+			err = helm.Delete(ctx, deploymentCache.Name)
+		} else {
+			ctx.Log().Errorf("error purging: deployment %s has no deployment method", deploymentCache.Name)
+			ctx.Config().RemoteCache().DeleteDeployment(deploymentCache.Name)
+			continue
+		}
+		if err != nil {
+			// Execute on error deployment purge hook
+			hookErr := hook.ExecuteHooks(ctx, map[string]interface{}{
+				"DEPLOY_NAME":   deploymentCache.Name,
+				"DEPLOY_CONFIG": deploymentCache,
+				"ERROR":         err,
+			}, hook.EventsForSingle("error:purge", deploymentCache.Name).With("deploy.errorPurge")...)
+			if hookErr != nil {
+				return hookErr
 			}
 
-			// Execute before deployment purge hook
-			err = c.hookExecuter.Execute(hook.Before, hook.StagePurgeDeployments, deployConfig.Name, hook.Context{Client: c.client}, log)
+			ctx.Log().Warnf("Error deleting deployment %s: %v", deploymentCache.Name, err)
+		} else {
+			err = hook.ExecuteHooks(ctx, map[string]interface{}{
+				"DEPLOY_NAME":   deploymentCache.Name,
+				"DEPLOY_CONFIG": deploymentCache,
+			}, hook.EventsForSingle("after:purge", deploymentCache.Name).With("deploy.afterPurge")...)
 			if err != nil {
 				return err
 			}
-			pluginErr := plugin.ExecutePluginHookWithContext("deploy.beforePurge", map[string]interface{}{
-				"DEPLOY_CONFIG": deployConfig,
-			})
-			if pluginErr != nil {
-				return pluginErr
-			}
 
-			log.StartWait("Deleting deployment " + deployConfig.Name)
-			err = deployClient.Delete()
-			log.StopWait()
-			if err != nil {
-				// Execute on error deployment purge hook
-				pluginErr := plugin.ExecutePluginHookWithContext("deploy.errorPurge", map[string]interface{}{
-					"DEPLOY_CONFIG": deployConfig,
-					"ERROR":         err,
-				})
-				if pluginErr != nil {
-					return pluginErr
-				}
-				hookErr := c.hookExecuter.Execute(hook.OnError, hook.StagePurgeDeployments, deployConfig.Name, hook.Context{Client: c.client}, log)
-				if hookErr != nil {
-					return hookErr
-				}
-
-				log.Warnf("Error deleting deployment %s: %v", deployConfig.Name, err)
-			} else {
-				pluginErr := plugin.ExecutePluginHookWithContext("deploy.afterPurge", map[string]interface{}{
-					"DEPLOY_CONFIG": deployConfig,
-				})
-				if pluginErr != nil {
-					return pluginErr
-				}
-				// Execute after deployment purge hook
-				err = c.hookExecuter.Execute(hook.After, hook.StagePurgeDeployments, deployConfig.Name, hook.Context{Client: c.client}, log)
-				if err != nil {
-					return err
-				}
-			}
-
-			log.Donef("Successfully deleted deployment %s", deployConfig.Name)
+			ctx.Log().Donef("Successfully deleted deployment %s", deploymentCache.Name)
 		}
 
-		// Execute after deployments purge hook
-		err = c.hookExecuter.Execute(hook.After, hook.StagePurgeDeployments, hook.All, hook.Context{Client: c.client}, log)
-		if err != nil {
-			return err
-		}
+		ctx.Config().RemoteCache().DeleteDeployment(deploymentCache.Name)
+	}
+
+	err = ctx.Config().RemoteCache().Save(ctx.Context(), ctx.KubeClient())
+	if err != nil {
+		return err
+	}
+
+	// Execute after deployments purge hook
+	err = hook.ExecuteHooks(ctx, nil, "after:purge")
+	if err != nil {
+		return err
 	}
 
 	return nil
-}
-
-// GetCachedHelmClient returns a helm client that could be cached in a helmV2Clients map. If not found it will add it to the map and create it
-func GetCachedHelmClient(config *latest.Config, deployConfig *latest.DeploymentConfig, client kubectlpkg.Client, helmV2Clients map[string]helmtypes.Client, dryInit bool, log log.Logger) (helmtypes.Client, error) {
-	var (
-		err        error
-		helmClient helmtypes.Client
-	)
-
-	tillerNamespace := getTillerNamespace(client, deployConfig)
-	if tillerNamespace != "" && helmV2Clients[tillerNamespace] != nil {
-		helmClient = helmV2Clients[tillerNamespace]
-	} else {
-		helmClient, err = helmclient.NewClient(config, deployConfig, client, tillerNamespace, false, dryInit, log)
-		if err != nil {
-			return nil, err
-		}
-
-		if tillerNamespace != "" {
-			helmV2Clients[tillerNamespace] = helmClient
-		}
-	}
-
-	return helmClient, nil
-}
-
-func getTillerNamespace(kubeClient kubectlpkg.Client, deployConfig *latest.DeploymentConfig) string {
-	if kubeClient != nil && deployConfig.Helm != nil && deployConfig.Helm.V2 == true {
-		tillerNamespace := kubeClient.Namespace()
-		if deployConfig.Helm.TillerNamespace != "" {
-			tillerNamespace = deployConfig.Helm.TillerNamespace
-		}
-
-		return tillerNamespace
-	}
-
-	return ""
 }

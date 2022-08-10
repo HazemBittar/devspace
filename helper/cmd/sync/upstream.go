@@ -2,10 +2,11 @@ package sync
 
 import (
 	"fmt"
-	"github.com/loft-sh/devspace/helper/server"
-	"github.com/spf13/cobra"
 	"os"
 	"path/filepath"
+
+	"github.com/loft-sh/devspace/helper/server"
+	"github.com/spf13/cobra"
 )
 
 // UpstreamCmd holds the upstream cmd flags
@@ -63,6 +64,7 @@ func (cmd *UpstreamCmd) Run(cobraCmd *cobra.Command, args []string) error {
 
 		OverridePermission: cmd.OverridePermissions,
 		ExitOnClose:        true,
+		Ping:               true,
 	})
 }
 
@@ -89,7 +91,7 @@ func ensurePath(args []string) (string, error) {
 	}
 
 	if absolutePath == "/" && path != "/" {
-		return "", fmt.Errorf("you are trying to sync the complete container root (/). By default this is not allowed, because this usually leads to unwanted behaviour. Please specify the correct container directory via the `--container-path` flag or `.containerPath` option")
+		return "", fmt.Errorf("you are trying to sync the complete container root (/). By default this is not allowed, because this usually leads to unwanted behaviour. Please specify the correct container directory via the `--path` flag or `.path: localPath:/remotePath` option")
 	}
 
 	return absolutePath, nil

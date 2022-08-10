@@ -4,9 +4,7 @@ import (
 	"archive/tar"
 	"encoding/json"
 	"fmt"
-	"github.com/docker/docker/builder/dockerignore"
-	"github.com/docker/docker/pkg/fileutils"
-	scanner2 "github.com/loft-sh/devspace/pkg/util/scanner"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
 	"io"
 	"io/ioutil"
 	"os"
@@ -14,6 +12,10 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/docker/docker/pkg/fileutils"
+	scanner2 "github.com/loft-sh/devspace/pkg/util/scanner"
+	"github.com/moby/buildkit/frontend/dockerfile/dockerignore"
 
 	"github.com/loft-sh/devspace/pkg/devspace/build/builder/restart"
 
@@ -39,19 +41,28 @@ const DefaultContextPath = "./"
 func ReadDockerignore(contextDir string, dockerfile string) ([]string, error) {
 	excludes := []string{}
 	useDevSpaceDockerignore := true
-	f, err := os.Open(filepath.Join(contextDir, "devspace.dockerignore"))
-	switch {
-	case os.IsNotExist(err):
-		f, err = os.Open(filepath.Join(contextDir, ".dockerignore"))
-		switch {
-		case os.IsNotExist(err):
-			return ensureDockerIgnoreAndDockerFile(excludes, dockerfile, false), nil
-		case err != nil:
+	dockerignorefilepath := "devspace.dockerignore"
+	f, err := os.Open(filepath.Join(contextDir, dockerignorefilepath))
+	if os.IsNotExist(err) {
+		useDevSpaceDockerignore = false
+		dockerignorefilepath = dockerfile + ".dockerignore"
+		if filepath.IsAbs(dockerignorefilepath) {
+			f, err = os.Open(dockerignorefilepath)
+		} else {
+			f, err = os.Open(filepath.Join(contextDir, dockerignorefilepath))
+		}
+		if os.IsNotExist(err) {
+			dockerignorefilepath = ".dockerignore"
+			f, err = os.Open(filepath.Join(contextDir, dockerignorefilepath))
+			if os.IsNotExist(err) {
+				return ensureDockerIgnoreAndDockerFile(excludes, dockerfile, dockerignorefilepath, useDevSpaceDockerignore), nil
+			} else if err != nil {
+				return nil, err
+			}
+		} else if err != nil {
 			return nil, err
 		}
-
-		useDevSpaceDockerignore = false
-	case err != nil:
+	} else if err != nil {
 		return nil, err
 	}
 	defer f.Close()
@@ -60,15 +71,16 @@ func ReadDockerignore(contextDir string, dockerfile string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ensureDockerIgnoreAndDockerFile(excludes, dockerfile, useDevSpaceDockerignore), nil
+	return ensureDockerIgnoreAndDockerFile(excludes, dockerfile, dockerignorefilepath, useDevSpaceDockerignore), nil
 }
 
-func ensureDockerIgnoreAndDockerFile(excludes []string, dockerfile string, useDevSpaceDockerignore bool) []string {
+func ensureDockerIgnoreAndDockerFile(excludes []string, dockerfile, dockerignorefilepath string, useDevSpaceDockerignore bool) []string {
 	if useDevSpaceDockerignore {
 		excludes = append(excludes, ".dockerignore")
 	} else {
-		if keep, _ := fileutils.Matches(".dockerignore", excludes); keep {
-			excludes = append(excludes, "!.dockerignore")
+		_, dockerignorefile := filepath.Split(dockerignorefilepath)
+		if keep, _ := fileutils.Matches(dockerignorefile, excludes); keep {
+			excludes = append(excludes, "!"+dockerignorefile)
 		}
 	}
 	if keep, _ := fileutils.Matches(dockerfile, excludes); keep {
@@ -79,7 +91,7 @@ func ensureDockerIgnoreAndDockerFile(excludes []string, dockerfile string, useDe
 }
 
 // GetDockerfileAndContext retrieves the dockerfile and context
-func GetDockerfileAndContext(imageConf *latest.ImageConfig) (string, string) {
+func GetDockerfileAndContext(ctx devspacecontext.Context, imageConf *latest.Image) (string, string) {
 	var (
 		dockerfilePath = DefaultDockerfilePath
 		contextPath    = DefaultContextPath
@@ -93,7 +105,7 @@ func GetDockerfileAndContext(imageConf *latest.ImageConfig) (string, string) {
 		contextPath = imageConf.Context
 	}
 
-	return dockerfilePath, contextPath
+	return ctx.ResolvePath(dockerfilePath), ctx.ResolvePath(contextPath)
 }
 
 // InjectBuildScriptInContext will add the restart helper script to the build context

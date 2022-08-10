@@ -3,7 +3,6 @@ package docker
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,7 +11,7 @@ import (
 	"github.com/docker/docker/api/types/registry"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/loft-sh/devspace/pkg/util/fsutil"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 
 	"gotest.tools/assert"
 )
@@ -88,7 +87,7 @@ func TestGetRegistryEndpoint(t *testing.T) {
 			CommonAPIClient: &fakeDockerClient{},
 		}
 
-		isDefault, endpoint, err := client.GetRegistryEndpoint(testCase.registryURL)
+		isDefault, endpoint, err := client.GetRegistryEndpoint(context.Background(), testCase.registryURL)
 
 		if !testCase.expectedErr {
 			assert.NilError(t, err, "Unexpected error in testCase %s", testCase.name)
@@ -131,10 +130,7 @@ func TestGetAuthConfig(t *testing.T) {
 		},
 	}
 
-	dir, err := ioutil.TempDir("", "test")
-	if err != nil {
-		t.Fatalf("Error creating temporary directory: %v", err)
-	}
+	dir := t.TempDir()
 
 	wdBackup, err := os.Getwd()
 	if err != nil {
@@ -153,10 +149,6 @@ func TestGetAuthConfig(t *testing.T) {
 		err = os.Chdir(wdBackup)
 		if err != nil {
 			t.Fatalf("Error changing dir back: %v", err)
-		}
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Fatalf("Error removing dir: %v", err)
 		}
 	}()
 
@@ -177,7 +169,7 @@ func TestGetAuthConfig(t *testing.T) {
 			CommonAPIClient: &fakeDockerClient{},
 		}
 
-		auth, err := client.GetAuthConfig(testCase.registryURL, testCase.checkCredentialsStore)
+		auth, err := client.GetAuthConfig(context.Background(), testCase.registryURL, testCase.checkCredentialsStore)
 
 		if !testCase.expectedErr {
 			assert.NilError(t, err, "Unexpected error in testCase %s", testCase.name)
@@ -188,7 +180,7 @@ func TestGetAuthConfig(t *testing.T) {
 		authAsYaml, err := yaml.Marshal(auth)
 		assert.NilError(t, err, "Error parsing authConfig to yaml in testCase %s", testCase.name)
 		expectedAsYaml, err := yaml.Marshal(testCase.expectedAuthConfig)
-		assert.NilError(t, err, "Error parsing expection to yaml in testCase %s", testCase.name)
+		assert.NilError(t, err, "Error parsing exception to yaml in testCase %s", testCase.name)
 		assert.Equal(t, string(authAsYaml), string(expectedAsYaml), "Unexpected authConfig in testCase %s", testCase.name)
 
 		err = filepath.Walk(".", func(path string, f os.FileInfo, err error) error {
@@ -230,10 +222,7 @@ func TestLogin(t *testing.T) {
 		},
 	}
 
-	dir, err := ioutil.TempDir("", "test")
-	if err != nil {
-		t.Fatalf("Error creating temporary directory: %v", err)
-	}
+	dir := t.TempDir()
 
 	wdBackup, err := os.Getwd()
 	if err != nil {
@@ -252,10 +241,6 @@ func TestLogin(t *testing.T) {
 		err = os.Chdir(wdBackup)
 		if err != nil {
 			t.Fatalf("Error changing dir back: %v", err)
-		}
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Fatalf("Error removing dir: %v", err)
 		}
 	}()
 
@@ -276,7 +261,7 @@ func TestLogin(t *testing.T) {
 			CommonAPIClient: &fakeDockerClient{},
 		}
 
-		auth, err := client.Login(testCase.registryURL, testCase.user, testCase.password, testCase.checkCredentialsStore, testCase.saveAuthConfig, testCase.relogin)
+		auth, err := client.Login(context.Background(), testCase.registryURL, testCase.user, testCase.password, testCase.checkCredentialsStore, testCase.saveAuthConfig, testCase.relogin)
 		if !testCase.expectedErr {
 			assert.NilError(t, err, "Unexpected error in testCase %s", testCase.name)
 		} else if err == nil {
@@ -286,7 +271,7 @@ func TestLogin(t *testing.T) {
 		authAsYaml, err := yaml.Marshal(auth)
 		assert.NilError(t, err, "Error parsing authConfig to yaml in testCase %s", testCase.name)
 		expectedAsYaml, err := yaml.Marshal(testCase.expectedAuthConfig)
-		assert.NilError(t, err, "Error parsing expection to yaml in testCase %s", testCase.name)
+		assert.NilError(t, err, "Error parsing exception to yaml in testCase %s", testCase.name)
 		assert.Equal(t, string(authAsYaml), string(expectedAsYaml), "Unexpected authConfig in testCase %s", testCase.name)
 
 		err = filepath.Walk(".", func(path string, f os.FileInfo, err error) error {

@@ -1,8 +1,8 @@
 package list
 
 import (
+	"context"
 	"github.com/loft-sh/devspace/pkg/devspace/config/loader"
-	"strconv"
 
 	"github.com/loft-sh/devspace/pkg/util/factory"
 	"github.com/loft-sh/devspace/pkg/util/log"
@@ -24,7 +24,7 @@ func newProfilesCmd(f factory.Factory) *cobra.Command {
 #######################################################
 ############## devspace list profiles #################
 #######################################################
-Lists all DevSpace configuartions for this project
+Lists all DevSpace configurations for this project
 #######################################################
 	`,
 		Args: cobra.NoArgs,
@@ -39,7 +39,10 @@ Lists all DevSpace configuartions for this project
 func (cmd *profilesCmd) RunListProfiles(f factory.Factory, cobraCmd *cobra.Command, args []string) error {
 	logger := f.GetLog()
 	// Set config root
-	configLoader := f.NewConfigLoader("")
+	configLoader, err := f.NewConfigLoader("")
+	if err != nil {
+		return err
+	}
 	configExists, err := configLoader.SetDevSpaceRoot(logger)
 	if err != nil {
 		return err
@@ -48,18 +51,16 @@ func (cmd *profilesCmd) RunListProfiles(f factory.Factory, cobraCmd *cobra.Comma
 		return errors.New(message.ConfigNotFound)
 	}
 
-	config, err := configLoader.LoadWithParser(loader.NewProfilesParser(), nil, logger)
+	config, err := configLoader.LoadWithParser(context.Background(), nil, nil, loader.NewProfilesParser(), nil, logger)
 	if err != nil {
 		return err
 	}
 
 	profiles := config.Config().Profiles
-	generatedConfig := config.Generated()
 
 	// Specify the table column names
 	headerColumnNames := []string{
 		"Name",
-		"Active",
 		"Description",
 	}
 
@@ -67,7 +68,6 @@ func (cmd *profilesCmd) RunListProfiles(f factory.Factory, cobraCmd *cobra.Comma
 	for _, profile := range profiles {
 		configRows = append(configRows, []string{
 			profile.Name,
-			strconv.FormatBool(profile.Name == generatedConfig.ActiveProfile),
 			profile.Description,
 		})
 	}

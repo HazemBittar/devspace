@@ -1,13 +1,19 @@
 package helm
 
 import (
+	"context"
 	"testing"
+
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
+	fakekube "github.com/loft-sh/devspace/pkg/devspace/kubectl/testing"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	"github.com/loft-sh/devspace/pkg/devspace/deploy/deployer"
 	fakehelm "github.com/loft-sh/devspace/pkg/devspace/helm/testing"
 	helmtypes "github.com/loft-sh/devspace/pkg/devspace/helm/types"
-	yaml "gopkg.in/yaml.v2"
+	log "github.com/loft-sh/devspace/pkg/util/log/testing"
+	yaml "gopkg.in/yaml.v3"
 	"gotest.tools/assert"
 )
 
@@ -24,7 +30,7 @@ type statusTestCase struct {
 
 func TestStatus(t *testing.T) {
 	testCases := []statusTestCase{
-		statusTestCase{
+		{
 			name:       "No releases",
 			deployment: "depl",
 			expectedStatus: deployer.StatusResult{
@@ -34,11 +40,11 @@ func TestStatus(t *testing.T) {
 				Status: "Not deployed",
 			},
 		},
-		statusTestCase{
+		{
 			name:       "Deployment not in releases",
 			deployment: "undeployed",
 			releases: []*helmtypes.Release{
-				&helmtypes.Release{
+				{
 					Name: "otherRelease",
 				},
 			},
@@ -55,11 +61,11 @@ func TestStatus(t *testing.T) {
 				Status: "Not deployed",
 			},
 		},
-		statusTestCase{
+		{
 			name:       "Deployment in releases with other status than deployed",
 			deployment: "release1",
 			releases: []*helmtypes.Release{
-				&helmtypes.Release{
+				{
 					Name:   "release1",
 					Status: "otherThanDeployed",
 				},
@@ -74,7 +80,6 @@ func TestStatus(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-
 		deployer := &DeployConfig{
 			Helm: &fakehelm.Client{
 				Releases: testCase.releases,
@@ -85,8 +90,12 @@ func TestStatus(t *testing.T) {
 			},
 		}
 
-		status, err := deployer.Status()
-
+		kube := fake.NewSimpleClientset()
+		kubeClient := &fakekube.Client{
+			Client: kube,
+		}
+		devCtx := devspacecontext.NewContext(context.Background(), nil, log.NewFakeLogger()).WithKubeClient(kubeClient)
+		status, err := deployer.Status(devCtx)
 		if testCase.expectedErr == "" {
 			assert.NilError(t, err, "Error in testCase %s", testCase.name)
 		} else {

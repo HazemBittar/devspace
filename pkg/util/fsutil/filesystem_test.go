@@ -1,19 +1,15 @@
 package fsutil
 
-import(
-	"io/ioutil"
+import (
 	"os"
 	"testing"
-	
+
 	"gotest.tools/assert"
 )
 
-func TestWriteReadFile(t *testing.T){
-	
-	dir, err := ioutil.TempDir("", "test")
-	if err != nil {
-		t.Fatalf("Error creating temporary directory: %v", err)
-	}
+func TestWriteReadFile(t *testing.T) {
+
+	dir := t.TempDir()
 
 	wdBackup, err := os.Getwd()
 	if err != nil {
@@ -29,10 +25,6 @@ func TestWriteReadFile(t *testing.T){
 		err = os.Chdir(wdBackup)
 		if err != nil {
 			t.Fatalf("Error changing dir back: %v", err)
-		}
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Fatalf("Error removing dir: %v", err)
 		}
 	}()
 
@@ -60,11 +52,8 @@ func TestWriteReadFile(t *testing.T){
 }
 
 func TestCopy(t *testing.T) {
-	
-	dir, err := ioutil.TempDir("", "test")
-	if err != nil {
-		t.Fatalf("Error creating temporary directory: %v", err)
-	}
+
+	dir := t.TempDir()
 
 	wdBackup, err := os.Getwd()
 	if err != nil {
@@ -81,10 +70,6 @@ func TestCopy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Error changing dir back: %v", err)
 		}
-		err = os.RemoveAll(dir)
-		if err != nil {
-			t.Fatalf("Error removing dir: %v", err)
-		}
 	}()
 
 	err = WriteToFile([]byte("Some Content"), "someDir/someFile")
@@ -92,7 +77,7 @@ func TestCopy(t *testing.T) {
 		t.Fatalf("Error using WriteToFile: %v", err)
 	}
 
-	Copy("someDir", "copiedDir", false)
+	_ = Copy("someDir", "copiedDir", false)
 
 	dirInfo, err := os.Stat("copiedDir")
 	assert.Equal(t, false, os.IsNotExist(err), "Copy called but no copied dir appeared")

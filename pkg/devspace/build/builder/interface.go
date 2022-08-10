@@ -1,12 +1,11 @@
 package builder
 
 import (
-	"github.com/loft-sh/devspace/pkg/devspace/config/generated"
-	"github.com/loft-sh/devspace/pkg/util/log"
+	devspacecontext "github.com/loft-sh/devspace/pkg/devspace/context"
 )
 
 // Interface defines methods for builders docker, kaniko and custom
 type Interface interface {
-	ShouldRebuild(cache *generated.CacheConfig, forceRebuild bool) (bool, error)
-	Build(log log.Logger) error
+	ShouldRebuild(ctx devspacecontext.Context, forceRebuild bool) (bool, error)
+	Build(ctx devspacecontext.Context) error
 }

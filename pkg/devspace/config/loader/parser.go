@@ -1,19 +1,24 @@
 package loader
 
 import (
-	"github.com/loft-sh/devspace/pkg/devspace/config/loader/expression"
+	"context"
 	"github.com/loft-sh/devspace/pkg/devspace/config/loader/variable"
+	"github.com/loft-sh/devspace/pkg/devspace/config/loader/variable/runtime"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	"github.com/loft-sh/devspace/pkg/util/log"
-	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
-	"path/filepath"
-	"strings"
+	"github.com/loft-sh/devspace/pkg/util/yamlutil"
+	"gopkg.in/yaml.v3"
 )
 
 type Parser interface {
-	Parse(configPath string, originalRawConfig map[interface{}]interface{}, rawConfig map[interface{}]interface{}, vars []*latest.Variable, resolver variable.Resolver, options *ConfigOptions, log log.Logger) (*latest.Config, error)
+	Parse(
+		ctx context.Context,
+		originalRawConfig map[string]interface{},
+		rawConfig map[string]interface{},
+		resolver variable.Resolver,
+		log log.Logger,
+	) (*latest.Config, map[string]interface{}, error)
 }
 
 func NewDefaultParser() Parser {
@@ -22,21 +27,25 @@ func NewDefaultParser() Parser {
 
 type defaultParser struct{}
 
-func (d *defaultParser) Parse(configPath string, originalRawConfig map[interface{}]interface{}, rawConfig map[interface{}]interface{}, vars []*latest.Variable, resolver variable.Resolver, options *ConfigOptions, log log.Logger) (*latest.Config, error) {
+func (d *defaultParser) Parse(ctx context.Context, originalRawConfig map[string]interface{}, rawConfig map[string]interface{}, resolver variable.Resolver, log log.Logger) (*latest.Config, map[string]interface{}, error) {
 	// delete the commands, since we don't need it in a normal scenario
-	delete(rawConfig, "commands")
-
-	return fillVariablesAndParse(configPath, rawConfig, vars, resolver, options, log)
+	return fillVariablesExcludeAndParse(ctx, resolver, rawConfig, log)
 }
 
-func NewWithCommandsParser() Parser {
-	return &withCommandsParser{}
+func NewCommandsPipelinesParser() Parser {
+	return &commandsPipelinesParser{}
 }
 
-type withCommandsParser struct{}
+type commandsPipelinesParser struct{}
 
-func (d *withCommandsParser) Parse(configPath string, originalRawConfig map[interface{}]interface{}, rawConfig map[interface{}]interface{}, vars []*latest.Variable, resolver variable.Resolver, options *ConfigOptions, log log.Logger) (*latest.Config, error) {
-	return fillVariablesAndParse(configPath, rawConfig, vars, resolver, options, log)
+func (c *commandsPipelinesParser) Parse(ctx context.Context, originalRawConfig map[string]interface{}, rawConfig map[string]interface{}, resolver variable.Resolver, log log.Logger) (*latest.Config, map[string]interface{}, error) {
+	// modify the config
+	preparedConfig, err := versions.Get(rawConfig, "commands", "pipelines")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return fillVariablesExcludeAndParse(ctx, resolver, preparedConfig, log)
 }
 
 func NewCommandsParser() Parser {
@@ -45,14 +54,14 @@ func NewCommandsParser() Parser {
 
 type commandsParser struct{}
 
-func (c *commandsParser) Parse(configPath string, originalRawConfig map[interface{}]interface{}, rawConfig map[interface{}]interface{}, vars []*latest.Variable, resolver variable.Resolver, options *ConfigOptions, log log.Logger) (*latest.Config, error) {
+func (c *commandsParser) Parse(ctx context.Context, originalRawConfig map[string]interface{}, rawConfig map[string]interface{}, resolver variable.Resolver, log log.Logger) (*latest.Config, map[string]interface{}, error) {
 	// modify the config
-	preparedConfig, err := versions.ParseCommands(rawConfig)
+	preparedConfig, err := versions.Get(rawConfig, "commands")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return fillVariablesAndParse(configPath, preparedConfig, vars, resolver, options, log)
+	return fillVariablesExcludeAndParse(ctx, resolver, preparedConfig, log)
 }
 
 func NewProfilesParser() Parser {
@@ -61,10 +70,10 @@ func NewProfilesParser() Parser {
 
 type profilesParser struct{}
 
-func (p *profilesParser) Parse(configPath string, originalRawConfig map[interface{}]interface{}, rawConfig map[interface{}]interface{}, vars []*latest.Variable, resolver variable.Resolver, options *ConfigOptions, log log.Logger) (*latest.Config, error) {
+func (p *profilesParser) Parse(ctx context.Context, originalRawConfig map[string]interface{}, rawConfig map[string]interface{}, resolver variable.Resolver, log log.Logger) (*latest.Config, map[string]interface{}, error) {
 	rawMap, err := copyRaw(originalRawConfig)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	profiles, ok := rawMap["profiles"].([]interface{})
@@ -74,7 +83,7 @@ func (p *profilesParser) Parse(configPath string, originalRawConfig map[interfac
 
 	retProfiles := []*latest.ProfileConfig{}
 	for _, profile := range profiles {
-		profileMap, ok := profile.(map[interface{}]interface{})
+		profileMap, ok := profile.(map[string]interface{})
 		if !ok {
 			continue
 		}
@@ -84,7 +93,7 @@ func (p *profilesParser) Parse(configPath string, originalRawConfig map[interfac
 		if err != nil {
 			continue
 		}
-		err = yaml.Unmarshal(o, profileConfig)
+		err = yamlutil.Unmarshal(o, profileConfig)
 		if err != nil {
 			continue
 		}
@@ -94,87 +103,51 @@ func (p *profilesParser) Parse(configPath string, originalRawConfig map[interfac
 
 	retConfig := latest.NewRaw()
 	retConfig.Profiles = retProfiles
-	return retConfig, nil
+	return retConfig, rawMap, nil
 }
 
-func fillVariablesAndParse(configPath string, preparedConfig map[interface{}]interface{}, vars []*latest.Variable, resolver variable.Resolver, options *ConfigOptions, log log.Logger) (*latest.Config, error) {
-	// fill in variables
-	err := fillVariables(resolver, preparedConfig, vars, options)
-	if err != nil {
-		return nil, err
-	}
-
-	// execute expressions
-	err = expression.ResolveAllExpressions(preparedConfig, filepath.Dir(configPath))
-	if err != nil {
-		return nil, err
-	}
-
-	// fill in variables again
-	err = fillVariables(resolver, preparedConfig, vars, options)
-	if err != nil {
-		return nil, err
-	}
-
-	// Now convert the whole config to latest
-	latestConfig, err := versions.Parse(preparedConfig, log)
-	if err != nil {
-		return nil, errors.Wrap(err, "convert config")
-	}
-
-	return latestConfig, nil
+func NewEagerParser() Parser {
+	return &eagerParser{}
 }
 
-// fillVariables fills in the given vars into the prepared config
-func fillVariables(resolver variable.Resolver, preparedConfig map[interface{}]interface{}, vars []*latest.Variable, options *ConfigOptions) error {
-	// Find out what vars are really used
-	varsUsed, err := resolver.FindVariables(preparedConfig, vars)
+type eagerParser struct{}
+
+func (e *eagerParser) Parse(ctx context.Context, originalRawConfig map[string]interface{}, rawConfig map[string]interface{}, resolver variable.Resolver, log log.Logger) (*latest.Config, map[string]interface{}, error) {
+	return fillAllVariablesAndParse(ctx, resolver, rawConfig, log)
+}
+
+func fillAllVariablesAndParse(ctx context.Context, resolver variable.Resolver, preparedConfig map[string]interface{}, log log.Logger) (*latest.Config, map[string]interface{}, error) {
+	return fillVariablesAndParse(ctx, resolver, preparedConfig, log)
+}
+
+func fillVariablesExcludeAndParse(ctx context.Context, resolver variable.Resolver, preparedConfig map[string]interface{}, log log.Logger) (*latest.Config, map[string]interface{}, error) {
+	return fillVariablesAndParse(ctx, resolver, preparedConfig, log, runtime.Locations...)
+}
+
+func fillVariablesAndParse(ctx context.Context, resolver variable.Resolver, preparedConfig map[string]interface{}, log log.Logger, excludedPaths ...string) (*latest.Config, map[string]interface{}, error) {
+	// fill in variables and expressions (leave out
+	preparedConfigInterface, err := resolver.FillVariablesExclude(ctx, preparedConfig, excludedPaths)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
-	// parse cli --var's, the resolver will cache them for us
-	_, err = resolver.ConvertFlags(options.Vars)
+	latestConfig, err := versions.Parse(preparedConfigInterface.(map[string]interface{}), log)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
-	// Fill used defined variables
-	if len(vars) > 0 {
-		newVars := []*latest.Variable{}
-		for _, v := range vars {
-			if varsUsed[strings.TrimSpace(v.Name)] {
-				newVars = append(newVars, v)
+	return latestConfig, preparedConfigInterface.(map[string]interface{}), nil
+}
+
+func EachDevContainer(devPod *latest.DevPod, each func(devContainer *latest.DevContainer) bool) {
+	if len(devPod.Containers) > 0 {
+		for _, devContainer := range devPod.Containers {
+			cont := each(devContainer)
+			if !cont {
+				break
 			}
 		}
-
-		if len(newVars) > 0 {
-			err = askQuestions(resolver, newVars)
-			if err != nil {
-				return err
-			}
-		}
+	} else {
+		_ = each(&devPod.DevContainer)
 	}
-
-	// Walk over data and fill in variables
-	err = resolver.FillVariables(preparedConfig)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func askQuestions(resolver variable.Resolver, vars []*latest.Variable) error {
-	for _, definition := range vars {
-		name := strings.TrimSpace(definition.Name)
-
-		// fill the variable with definition
-		_, err := resolver.Resolve(name, definition)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
 }

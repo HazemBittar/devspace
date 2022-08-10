@@ -2,6 +2,7 @@ package sync
 
 import (
 	"github.com/loft-sh/devspace/helper/remote"
+	"github.com/loft-sh/devspace/pkg/util/log"
 	"os"
 )
 
@@ -35,7 +36,7 @@ func shouldRemoveRemote(relativePath string, s *Sync) bool {
 }
 
 // s.fileIndex needs to be locked before this function is called
-func shouldUpload(s *Sync, fileInformation *FileInformation) bool {
+func shouldUpload(s *Sync, fileInformation *FileInformation, log log.Logger) bool {
 	// Exclude if stat is nil
 	if fileInformation == nil {
 		return false
@@ -49,30 +50,33 @@ func shouldUpload(s *Sync, fileInformation *FileInformation) bool {
 
 	// Exclude local symlinks
 	if fileInformation.IsSymbolicLink {
+		log.Debugf("Don't upload %s because it is a symbolic link", fileInformation.Name)
 		return false
 	}
 
 	// Exclude changes on the exclude list
-	if s.ignoreMatcher != nil {
-		if s.ignoreMatcher.Matches(fileInformation.Name, fileInformation.IsDirectory) {
-			return false
-		}
+	if s.ignoreMatcher != nil && s.ignoreMatcher.Matches(fileInformation.Name, fileInformation.IsDirectory) {
+		log.Debugf("Don't upload %s because it is excluded", fileInformation.Name)
+		return false
 	}
 
 	// Check if we already tracked the path
 	if s.fileIndex.fileMap[fileInformation.Name] != nil {
 		// Folder already exists, don't send change
 		if fileInformation.IsDirectory {
+			log.Debugf("Don't upload %s because directory already exists", fileInformation.Name)
 			return false
 		}
 
 		// Exclude symlinks
 		if s.fileIndex.fileMap[fileInformation.Name].IsSymbolicLink {
+			log.Debugf("Don't upload %s because it is a symbolic link", fileInformation.Name)
 			return false
 		}
 
 		// File did not change or was changed by downstream
 		if fileInformation.Mtime == s.fileIndex.fileMap[fileInformation.Name].Mtime && fileInformation.Size == s.fileIndex.fileMap[fileInformation.Name].Size {
+			log.Debugf("Don't upload %s because mtime and size have not changed", fileInformation.Name)
 			return false
 		}
 	}
@@ -85,7 +89,7 @@ func shouldDownload(change *remote.Change, s *Sync) bool {
 	// Does file already exist in the filemap?
 	if s.fileIndex.fileMap[change.Path] != nil {
 		// Don't override folders that exist in the filemap
-		if change.IsDir == false {
+		if !change.IsDir {
 			// Redownload file if mtime is newer than saved one
 			if change.MtimeUnix > s.fileIndex.fileMap[change.Path].Mtime {
 				return true
@@ -123,7 +127,7 @@ func shouldRemoveLocal(absFilepath string, fileInformation *FileInformation, s *
 	// Only delete if mtime and size did not change
 	stat, err := os.Lstat(absFilepath)
 	if err != nil {
-		if os.IsNotExist(err) == false {
+		if !os.IsNotExist(err) {
 			s.log.Infof("Skip %s because stat returned %v", absFilepath, err)
 		}
 
@@ -140,11 +144,11 @@ func shouldRemoveLocal(absFilepath string, fileInformation *FileInformation, s *
 	// We don't delete the file if we haven't tracked it
 	if stat != nil && s.fileIndex.fileMap[fileInformation.Name] != nil {
 		if stat.IsDir() != s.fileIndex.fileMap[fileInformation.Name].IsDirectory || stat.IsDir() != fileInformation.IsDirectory {
-			s.log.Infof("Skip %s because stat returned unequal isdir with fileMap", absFilepath)
+			s.log.Debugf("Skip %s because stat returned unequal isdir with fileMap", absFilepath)
 			return false
 		}
 
-		if fileInformation.IsDirectory == false {
+		if !fileInformation.IsDirectory {
 			// We don't delete the file if it has changed in the map since we collected changes
 			if fileInformation.Mtime == s.fileIndex.fileMap[fileInformation.Name].Mtime && fileInformation.Size == s.fileIndex.fileMap[fileInformation.Name].Size {
 				// We don't delete the file if it has changed on the filesystem meanwhile
@@ -152,7 +156,7 @@ func shouldRemoveLocal(absFilepath string, fileInformation *FileInformation, s *
 					return true
 				}
 
-				s.log.Infof("Skip %s because stat.ModTime() %d is greater than fileInformation.Mtime %d", absFilepath, stat.ModTime().Unix(), fileInformation.Mtime)
+				s.log.Debugf("Skip %s because stat.ModTime() %d is greater than fileInformation.Mtime %d", absFilepath, stat.ModTime().Unix(), fileInformation.Mtime)
 			} else {
 				// s.log.Infof("Skip %s because Mtime (%d and %d) or Size (%d and %d) is unequal between fileInformation and fileMap", absFilepath, fileInformation.Mtime, s.fileIndex.fileMap[fileInformation.Name].Mtime, fileInformation.Size, s.fileIndex.fileMap[fileInformation.Name].Size)
 				return true

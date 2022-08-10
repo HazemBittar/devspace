@@ -1,12 +1,15 @@
 package sync
 
 import (
-	"github.com/loft-sh/devspace/helper/server/ignoreparser"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
+
+	"github.com/loft-sh/devspace/helper/server/ignoreparser"
 
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
 	"github.com/loft-sh/devspace/pkg/util/log"
@@ -24,17 +27,16 @@ const waitForMoreChangesTimeout = time.Minute
 type Options struct {
 	Polling bool
 
+	Exec []latest.SyncExec
+
+	ResolveCommand func(command string, args []string) (string, []string, error)
+
 	ExcludePaths         []string
 	DownloadExcludePaths []string
 	UploadExcludePaths   []string
 
 	RestartContainer bool
-
-	FileChangeCmd  string
-	FileChangeArgs []string
-
-	DirCreateCmd  string
-	DirCreateArgs []string
+	StartContainer   bool
 
 	UploadBatchCmd  string
 	UploadBatchArgs []string
@@ -49,11 +51,16 @@ type Options struct {
 	InitialSyncCompareBy latest.InitialSyncCompareBy
 	InitialSync          latest.InitialSyncStrategy
 
+	Starter DelayedContainerStarter
+
 	Log log.Logger
 }
 
 // Sync holds the necessary information for the syncing process
 type Sync struct {
+	ctx       context.Context
+	cancelCtx context.CancelFunc
+
 	LocalPath string
 	Options   Options
 
@@ -69,7 +76,6 @@ type Sync struct {
 	upstream   *upstream
 	downstream *downstream
 
-	silent   bool
 	stopOnce sync.Once
 
 	onError chan error
@@ -80,28 +86,40 @@ type Sync struct {
 }
 
 // NewSync creates a new sync for the given
-func NewSync(localPath string, options Options) (*Sync, error) {
+func NewSync(ctx context.Context, localPath string, options Options) (*Sync, error) {
+	cancelCtx, cancel := context.WithCancel(ctx)
+
 	// we have to resolve the real local path, because the watcher gives us the real path always
 	realLocalPath, err := filepath.EvalSymlinks(localPath)
 	if err != nil {
+		cancel()
 		return nil, errors.Wrap(err, "eval symlinks")
 	}
 
 	absoluteLocalPath, err := filepath.Abs(realLocalPath)
 	if err != nil {
+		cancel()
 		return nil, errors.Wrap(err, "absolute path")
 	}
 
-	if options.ExcludePaths == nil {
-		options.ExcludePaths = []string{}
+	absoluteRealLocalPath, err := filepath.EvalSymlinks(absoluteLocalPath)
+	if err != nil {
+		cancel()
+		return nil, errors.Wrap(err, "eval symlinks")
 	}
 
 	// We exclude the sync log to prevent an endless loop in upstream
-	options.ExcludePaths = append(options.ExcludePaths, ".devspace/")
+	newExcludes := []string{}
+	newExcludes = append(newExcludes, ".devspace/")
+	newExcludes = append(newExcludes, options.ExcludePaths...)
+	options.ExcludePaths = newExcludes
 
 	// Create sync structure
 	s := &Sync{
-		LocalPath: absoluteLocalPath,
+		ctx:       cancelCtx,
+		cancelCtx: cancel,
+
+		LocalPath: absoluteRealLocalPath,
 		Options:   options,
 
 		fileIndex: newFileIndex(),
@@ -148,13 +166,17 @@ func (s *Sync) Start(onInitUploadDone chan struct{}, onInitDownloadDone chan str
 	s.onError = onError
 	s.onDone = onDone
 
+	// start pinging the underlying connection
+	s.downstream.startPing(onDone)
+	s.upstream.startPing(onDone)
+
 	s.mainLoop(onInitUploadDone, onInitDownloadDone)
 	return nil
 }
 
 func (s *Sync) initIgnoreParsers() error {
 	if s.Options.ExcludePaths != nil {
-		ignoreMatcher, err := ignoreparser.CompilePaths(s.Options.ExcludePaths)
+		ignoreMatcher, err := ignoreparser.CompilePaths(s.Options.ExcludePaths, s.log)
 		if err != nil {
 			return errors.Wrap(err, "compile exclude paths")
 		}
@@ -163,7 +185,7 @@ func (s *Sync) initIgnoreParsers() error {
 	}
 
 	if s.Options.DownloadExcludePaths != nil {
-		ignoreMatcher, err := ignoreparser.CompilePaths(s.Options.DownloadExcludePaths)
+		ignoreMatcher, err := ignoreparser.CompilePaths(s.Options.DownloadExcludePaths, s.log)
 		if err != nil {
 			return errors.Wrap(err, "compile download exclude paths")
 		}
@@ -172,7 +194,7 @@ func (s *Sync) initIgnoreParsers() error {
 	}
 
 	if s.Options.UploadExcludePaths != nil {
-		ignoreMatcher, err := ignoreparser.CompilePaths(s.Options.UploadExcludePaths)
+		ignoreMatcher, err := ignoreparser.CompilePaths(s.Options.UploadExcludePaths, s.log)
 		if err != nil {
 			return errors.Wrap(err, "compile upload exclude paths")
 		}
@@ -187,7 +209,7 @@ func (s *Sync) mainLoop(onInitUploadDone chan struct{}, onInitDownloadDone chan 
 	s.log.Info("Start syncing")
 
 	// Start upstream as early as possible
-	if s.Options.UpstreamDisabled == false {
+	if !s.Options.UpstreamDisabled {
 		go s.startUpstream()
 	}
 
@@ -199,7 +221,7 @@ func (s *Sync) mainLoop(onInitUploadDone chan struct{}, onInitDownloadDone chan 
 			return
 		}
 
-		if s.Options.DownstreamDisabled == false {
+		if !s.Options.DownstreamDisabled {
 			s.startDownstream()
 			s.Stop(nil)
 		}
@@ -248,22 +270,6 @@ func (s *Sync) startDownstream() {
 }
 
 func (s *Sync) initialSync(onInitUploadDone chan struct{}, onInitDownloadDone chan struct{}) error {
-	err := s.downstream.populateFileMap()
-	if err != nil {
-		return errors.Wrap(err, "populate file map")
-	}
-
-	downloadChanges := make(map[string]*FileInformation)
-	s.fileIndex.fileMapMutex.Lock()
-	for key, element := range s.fileIndex.fileMap {
-		if element.IsSymbolicLink {
-			continue
-		}
-
-		downloadChanges[key] = element
-	}
-	s.fileIndex.fileMapMutex.Unlock()
-
 	initialSync := newInitialSyncer(&initialSyncOptions{
 		LocalPath: s.LocalPath,
 		Strategy:  s.Options.InitialSync,
@@ -283,13 +289,25 @@ func (s *Sync) initialSync(onInitUploadDone chan struct{}, onInitDownloadDone ch
 		Log:         s.log,
 
 		UpstreamDone: func() {
-			if onInitUploadDone != nil {
-				if s.Options.UpstreamDisabled == false {
-					for len(s.upstream.events) > 0 || s.upstream.IsBusy() {
-						time.Sleep(time.Millisecond * 100)
-					}
+			if !s.Options.UpstreamDisabled {
+				for s.upstream.IsBusy() {
+					time.Sleep(time.Millisecond * 100)
 				}
+			}
 
+			// signal upstream that initial sync is done
+			s.upstream.initialSyncCompletedMutex.Lock()
+			s.upstream.initialSyncCompleted = true
+			s.upstream.initialSyncCompletedMutex.Unlock()
+
+			// wait until initial sync commands were executed
+			if !s.Options.UpstreamDisabled {
+				for s.upstream.IsInitialSyncing() {
+					time.Sleep(time.Millisecond * 100)
+				}
+			}
+
+			if onInitUploadDone != nil {
 				s.log.Info("Upstream - Initial sync completed")
 				close(onInitUploadDone)
 			}
@@ -302,7 +320,40 @@ func (s *Sync) initialSync(onInitUploadDone chan struct{}, onInitDownloadDone ch
 		},
 	})
 
-	return initialSync.Run(downloadChanges)
+	s.log.Debugf("Initial Sync - Retrieve Initial State")
+	errChan := make(chan error)
+	go func() {
+		errChan <- s.downstream.populateFileMap()
+	}()
+
+	localState := make(map[string]*FileInformation)
+	err := initialSync.CalculateLocalState(s.LocalPath, localState, false)
+	if err != nil {
+		<-errChan
+		return err
+	}
+
+	err = <-errChan
+	s.log.Debugf("Initial Sync - Done Retrieving Initial State")
+	if err != nil {
+		return errors.Wrap(err, "populate file map")
+	}
+
+	downloadChanges := make(map[string]*FileInformation)
+	s.fileIndex.fileMapMutex.Lock()
+	for key, element := range s.fileIndex.fileMap {
+		if s.downloadIgnoreMatcher != nil && s.downloadIgnoreMatcher.Matches(element.Name, element.IsDirectory) {
+			continue
+		}
+		if element.IsSymbolicLink {
+			continue
+		}
+
+		downloadChanges[key] = element
+	}
+	s.fileIndex.fileMapMutex.Unlock()
+
+	return initialSync.Run(downloadChanges, localState)
 }
 
 func (s *Sync) sendChangesToUpstream(changes []*FileInformation, remove bool) {
@@ -319,7 +370,7 @@ func (s *Sync) sendChangesToUpstream(changes []*FileInformation, remove bool) {
 		for i := j; i < (j+initialUpstreamBatchSize) && i < len(changes); i++ {
 			if remove {
 				sendBatch = append(sendBatch, changes[i])
-			} else if s.fileIndex.fileMap[changes[i].Name] == nil || changes[i].Mtime > s.fileIndex.fileMap[changes[i].Name].Mtime || changes[i].Size != s.fileIndex.fileMap[changes[i].Name].Size {
+			} else if s.fileIndex.fileMap[changes[i].Name] == nil || !equalFilePermissions(changes[i].Mode, s.fileIndex.fileMap[changes[i].Name].Mode) || changes[i].Mtime != s.fileIndex.fileMap[changes[i].Name].Mtime || changes[i].Size != s.fileIndex.fileMap[changes[i].Name].Size {
 				sendBatch = append(sendBatch, changes[i])
 			}
 		}
@@ -337,15 +388,22 @@ func (s *Sync) sendChangesToUpstream(changes []*FileInformation, remove bool) {
 	}
 }
 
+func equalFilePermissions(mode os.FileMode, mode2 os.FileMode) bool {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		return true
+	}
+
+	return mode == mode2
+}
+
 // Stop stops the sync process
 func (s *Sync) Stop(fatalError error) {
 	s.stopOnce.Do(func() {
-		if s.upstream != nil && s.upstream.interrupt != nil {
+		s.cancelCtx()
+		if s.upstream != nil {
 			for _, symlink := range s.upstream.symlinks {
 				symlink.Stop()
 			}
-
-			close(s.upstream.interrupt)
 			if s.upstream.writer != nil {
 				s.upstream.writer.Close()
 			}
@@ -354,8 +412,7 @@ func (s *Sync) Stop(fatalError error) {
 			}
 		}
 
-		if s.downstream != nil && s.downstream.interrupt != nil {
-			close(s.downstream.interrupt)
+		if s.downstream != nil {
 			if s.downstream.writer != nil {
 				s.downstream.writer.Close()
 			}
@@ -374,7 +431,7 @@ func (s *Sync) Stop(fatalError error) {
 			}
 		}
 
-		s.log.Infof("Sync stopped")
+		s.log.Debugf("Sync stopped")
 		if s.onDone != nil {
 			close(s.onDone)
 		}
